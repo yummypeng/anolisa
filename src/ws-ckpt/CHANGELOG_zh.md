@@ -2,6 +2,20 @@
 
 [English](CHANGELOG.md)
 
+## 0.4.3
+
+### 新功能
+
+- 新增 k8s sidecar 容器化部署支持 (#2034)
+
+### 缺陷修复
+
+- 修复 daemon accept 循环中已完成任务未回收导致的内存泄漏 (#2554)
+- 修复 loop device 未启用 direct-IO 导致的双重页缓存性能瓶颈 (#2523)
+- 修复 bootstrap 失败时的资源清理和错误信息输出 (#1956)
+- 修复 workspace root 已被挂载时 init 报 EBUSY 无明确提示 (#1798)
+- 补充 RPM 组件身份声明以支持 anolisa-cli 适配器发现 (#2568)
+
 ## 0.4.2
 
 ### 新功能

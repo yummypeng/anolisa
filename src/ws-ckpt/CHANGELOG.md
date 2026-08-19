@@ -2,6 +2,18 @@
 
 [中文版](CHANGELOG_zh.md)
 
+## 0.4.3
+
+### Features
+- Added k8s sidecar containerized deployment support (#2034)
+
+### Bug Fixes
+- Fixed daemon memory leak by reaping finished tasks in accept loop (#2554)
+- Fixed loop device direct-IO mode to eliminate double page-cache bottleneck (#2523)
+- Fixed bootstrap failure cleanup and error reporting (#1956)
+- Fixed init to reject mounted workspace root with a clear error instead of EBUSY (#1798)
+- Added RPM component identity declaration for anolisa-cli discovery (#2568)
+
 ## 0.4.2
 
 ### Features
