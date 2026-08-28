@@ -1,0 +1,150 @@
+# Dedicated ws-ckpt daemon sidecar image for Alibaba Cloud Linux 4.
+#
+# This image runs ONE process: `ws-ckpt daemon ...`. It deliberately does not
+# include or start systemd or any other ANOLISA service. The daemon container
+# is expected to run privileged (losetup + mount + mkfs.btrfs) and to share
+# its socket and btrfs mount with the app container via pod volumes; see
+# k8s-sidecar-example.yaml and docs/k8s-sidecar-deploy.md for the topology.
+#
+# Build context: the `src/ws-ckpt` component directory.
+#   docker build -f container/Dockerfile.alinux4 .
+
+# ---------------------------------------------------------------------------
+# Stage 1 — builder
+# ---------------------------------------------------------------------------
+# The builder and the runtime share the same base image so the produced binary
+# links against the runtime glibc ABI. Do not swap one side only.
+ARG BASE_IMAGE=alibaba-cloud-linux-4-registry.cn-hangzhou.cr.aliyuncs.com/alinux4/alinux4:latest
+
+FROM ${BASE_IMAGE} AS builder
+
+# Alibaba Cloud Linux 4 ships a Rust toolchain newer than ws-ckpt's minimum
+# (1.78), so use the distro-tested compiler and package manager. The daemon
+# has pure-Rust dependencies only, so no *-devel packages are needed.
+RUN set -eux; \
+    sed -i \
+        's#mirrors\.cloud\.aliyuncs\.com#mirrors.aliyun.com#g' \
+        /etc/yum.repos.d/*.repo; \
+    dnf install -y --setopt=install_weak_deps=False \
+        gcc \
+        make \
+        binutils \
+        rust \
+        cargo \
+        ca-certificates; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf; \
+    rustc --version; \
+    cargo --version
+
+WORKDIR /build
+
+# Use the public Aliyun sparse registry by default for reliable builds in China.
+# Set this argument to an empty value to use Cargo's official crates.io source.
+ARG WSCKPT_CARGO_REGISTRY_INDEX=sparse+https://mirrors.aliyun.com/crates.io-index/
+
+# Source replacement keeps Cargo.lock identities and checksums while routing
+# both the sparse index and crate downloads through the selected mirror.
+RUN set -eux; \
+    if [ -n "${WSCKPT_CARGO_REGISTRY_INDEX}" ]; then \
+        mkdir -p /root/.cargo; \
+        printf '%s\n' \
+            '[source.crates-io]' \
+            'replace-with = "mirror"' \
+            '[source.mirror]' \
+            "registry = \"${WSCKPT_CARGO_REGISTRY_INDEX}\"" \
+            > /root/.cargo/config.toml; \
+    fi
+
+# Copy the whole component. `.dockerignore` keeps `src/target/`, node_modules,
+# and docs/tests out of the context so the image does not embed host build
+# artifacts. The openclaw/hermes adapters are not built here: the sidecar
+# ships the daemon + CLI binary only.
+COPY . /build
+
+# `--locked` makes the dependency set exactly Cargo.lock, which is what makes
+# repeated builds of the same commit produce the same dependency tree.
+# The Cargo workspace lives in `src/`, unlike most components.
+RUN set -eux; \
+    cd src; \
+    RUSTFLAGS="-C opt-level=3 -C codegen-units=1" \
+        cargo build --release --locked -p ws-ckpt-cli; \
+    strip target/release/ws-ckpt; \
+    target/release/ws-ckpt --version
+
+# ---------------------------------------------------------------------------
+# Stage 2 — runtime
+# ---------------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS runtime
+
+ARG VERSION=unknown
+ARG REVISION=unknown
+ARG SOURCE_URL=https://github.com/alibaba/anolisa
+
+# Runtime tooling the daemon shells out to, mirroring the requirements in
+# docs/k8s-sidecar-deploy.md:
+#   btrfs-progs   btrfs / mkfs.btrfs (both backends)
+#   util-linux    losetup / mount / umount / findmnt
+#   psmisc        fuser (mount-busy checks in rollback/recover/shrink)
+#   rsync         workspace data copy on init
+#   kmod          modprobe btrfs/loop (entrypoint preflight, best-effort)
+#   coreutils     truncate / sync / stat / cp
+#   findutils     find (orphan cleanup)
+#   which         backend probing
+# bash/grep serve the entrypoint's preflight checks.
+RUN set -eux; \
+    sed -i \
+        's#mirrors\.cloud\.aliyuncs\.com#mirrors.aliyun.com#g' \
+        /etc/yum.repos.d/*.repo; \
+    dnf install -y --setopt=install_weak_deps=False \
+        btrfs-progs \
+        rsync \
+        util-linux \
+        psmisc \
+        kmod \
+        coreutils \
+        findutils \
+        which \
+        bash \
+        grep; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf
+
+COPY --from=builder /build/src/target/release/ws-ckpt /usr/local/bin/ws-ckpt
+COPY container/entrypoint.sh /usr/local/bin/ws-ckpt-entrypoint
+# Bare `docker run` users get the sample config in its canonical location. In
+# the k8s sidecar topology the /etc/ws-ckpt emptyDir shadows this file, which
+# is expected and documented in docs/k8s-sidecar-deploy.md.
+COPY src/config.toml.sample /etc/ws-ckpt/config.toml.sample
+
+RUN set -eux; \
+    chmod 0755 /usr/local/bin/ws-ckpt /usr/local/bin/ws-ckpt-entrypoint; \
+    chmod 0644 /etc/ws-ckpt/config.toml.sample; \
+    mkdir -p /var/lib/ws-ckpt /run/ws-ckpt; \
+    ws-ckpt --version
+
+# Defaults match the CLI built-in defaults; override per deployment.
+#
+# WS_CKPT_MOUNT_PATH must match the pod's mount-anchor volumeMount path
+# exactly: the daemon overmounts btrfs there and mount propagation carries it
+# to the app container.
+#
+# WS_CKPT_SOCKET lives on the shared socket volume so the unprivileged app
+# container's CLI reaches the daemon.
+ENV WS_CKPT_MOUNT_PATH=/mnt/btrfs-workspace \
+    WS_CKPT_SOCKET=/run/ws-ckpt/ws-ckpt.sock \
+    WS_CKPT_LOG_LEVEL=info \
+    RUST_LOG=info
+
+LABEL org.opencontainers.image.title="ws-ckpt daemon sidecar for Alibaba Cloud Linux 4" \
+      org.opencontainers.image.description="ws-ckpt btrfs workspace checkpoint daemon for Kubernetes sidecar deployment" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.vendor="The Anolisa Authors"
+
+# The entrypoint runs preflight checks and then `exec`s the daemon, so the
+# daemon becomes PID 1 and receives SIGTERM directly from the kubelet. Loop
+# device cleanup on teardown belongs to the pod's preStop hook, not here.
+ENTRYPOINT ["/usr/local/bin/ws-ckpt-entrypoint"]

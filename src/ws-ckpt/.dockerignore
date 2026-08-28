@@ -1,0 +1,34 @@
+# Keep the ws-ckpt sidecar build context small and free of host artifacts, so
+# the image contents depend only on tracked sources plus Cargo.lock.
+.git/
+.gitignore
+
+# Host build artifacts must never reach the image.
+src/target/
+**/node_modules/
+
+# The sidecar image ships the daemon + CLI binary only. Adapters, skills,
+# systemd units, RPM packaging, and tests are not inputs to that build.
+src/plugins/
+src/skills/
+src/systemd/
+scripts/
+tests/
+docs/
+*.spec.in
+build-rpm.sh
+Makefile
+component.toml
+
+# Documentation and repo metadata are not needed by the build.
+CHANGELOG.md
+CHANGELOG_zh.md
+README.md
+README_zh.md
+LICENSE
+k8s-sidecar-example.yaml
+
+# Local scratch that must never reach the image.
+*.log
+*.tmp
+tmp/
