@@ -140,6 +140,14 @@ pub(crate) async fn dispatch_with_context(
             Some(ws) => crate::snapshot_mgr::list_snapshots(state, &ws).await,
             None => crate::snapshot_mgr::list_all_snapshots(state).await,
         },
+        Request::ListPage {
+            workspace,
+            limit,
+            cursor,
+        } => {
+            crate::snapshot_list::list_page(state, workspace.as_deref(), limit, cursor.as_deref())
+                .await
+        }
         Request::Diff {
             workspace,
             from,

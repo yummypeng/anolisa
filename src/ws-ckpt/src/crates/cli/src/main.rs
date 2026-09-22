@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -11,11 +12,12 @@ use tokio::net::UnixStream;
 use ws_ckpt_common::{
     decode_payload, default_auto_cleanup_keep, encode_frame, load_config_file, save_config_file,
     ChangeType, CleanupRetention, DaemonConfig, ErrorCode, GlobalConfigJson, PolicyFieldOp,
-    RecoveryPreview, Request, Response, WorkspacePolicyJson, ADVISORY_SNAPSHOT_LIMIT,
-    CONFIG_FILE_PATH, DEFAULT_AUTO_CLEANUP, DEFAULT_AUTO_CLEANUP_INTERVAL_SECS,
-    DEFAULT_HEALTH_CHECK_INTERVAL_SECS, DEFAULT_IMG_MAX_PERCENT, DEFAULT_IMG_SIZE_GB,
-    DEFAULT_MOUNT_PATH, DEFAULT_SOCKET_PATH, GLOBAL_CONFIG_JSON_SCHEMA, MAX_FRAME_SIZE,
-    OVERVIEW_JSON_SCHEMA,
+    RecoveryPreview, Request, Response, SnapshotEntry, WorkspacePolicyJson,
+    ADVISORY_SNAPSHOT_LIMIT, CONFIG_FILE_PATH, DEFAULT_AUTO_CLEANUP,
+    DEFAULT_AUTO_CLEANUP_INTERVAL_SECS, DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
+    DEFAULT_IMG_MAX_PERCENT, DEFAULT_IMG_SIZE_GB, DEFAULT_LIST_PAGE_LIMIT, DEFAULT_MOUNT_PATH,
+    DEFAULT_SOCKET_PATH, GLOBAL_CONFIG_JSON_SCHEMA, MAX_FRAME_SIZE, MAX_LIST_CURSOR_BYTES,
+    MAX_LIST_PAGE_LIMIT, OVERVIEW_JSON_SCHEMA,
 };
 
 use std::cell::RefCell;
@@ -198,11 +200,19 @@ enum Commands {
         force: bool,
     },
 
-    /// List all snapshots for a workspace (or all workspaces if omitted)
+    /// List snapshots for a workspace (or all workspaces if omitted)
     List {
         /// Workspace path or ID (optional; omit to list all workspaces)
         #[arg(long, short = 'w', value_parser = workspace_value_parser())]
         workspace: Option<String>,
+
+        /// Return one page with at most this many snapshots (1-1000)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_LIST_PAGE_LIMIT)))]
+        limit: Option<u32>,
+
+        /// Return one page from an opaque cursor (default page limit: 100)
+        #[arg(long, value_parser = list_cursor_value_parser())]
+        cursor: Option<String>,
 
         /// Output format: table or json (default: table)
         #[arg(long, default_value = "table")]
@@ -494,13 +504,20 @@ async fn run(cli: Cli) -> Result<()> {
             let response = send_request_to_daemon(&request).await?;
             handle_response(response, &request).await?;
         }
-        Commands::List { workspace, format } => {
-            let request = Request::List {
-                workspace: workspace.as_deref().map(resolve_workspace_arg),
-                format: Some(format.clone()),
-            };
-            let response = send_request_to_daemon(&request).await?;
-            handle_list_response(response, &format)?;
+        Commands::List {
+            workspace,
+            limit,
+            cursor,
+            format,
+        } => {
+            handle_list_command(
+                workspace.as_deref().map(resolve_workspace_arg),
+                limit,
+                cursor,
+                &format,
+                |request| async move { send_request_to_daemon(&request).await },
+            )
+            .await?;
         }
         Commands::Diff {
             workspace,
@@ -1063,87 +1080,178 @@ async fn handle_response(response: Response, original_request: &Request) -> Resu
     Ok(())
 }
 
-/// Handle ListOk response, formatting as table or json.
-fn handle_list_response(response: Response, format: &str) -> Result<()> {
-    match response {
-        Response::ListOk { snapshots } => {
-            if format == "json" {
-                emit_json(serde_json::to_value(&snapshots)?);
-            } else {
-                // Table format
-                if snapshots.is_empty() {
-                    println!("No snapshots found.");
-                } else {
-                    // Dynamically compute column widths
-                    let hdr_ws = "WORKSPACE";
-                    let hdr_snap = "SNAPSHOT";
-                    let offset_secs = chrono::Local::now().offset().local_minus_utc();
-                    let sign = if offset_secs >= 0 { '+' } else { '-' };
-                    let h = offset_secs.abs() / 3600;
-                    let m = (offset_secs.abs() % 3600) / 60;
-                    let local_offset = if m == 0 {
-                        format!("{sign}{h}")
-                    } else {
-                        format!("{sign}{h}:{m:02}")
-                    };
-                    let hdr_date = format!("CREATED (UTC{local_offset})");
-                    let hdr_date = hdr_date.as_str();
-                    let hdr_msg = "MESSAGE";
+fn list_cursor_value_parser() -> impl TypedValueParser<Value = String> {
+    StringValueParser::new().try_map(|cursor: String| {
+        if cursor.len() > MAX_LIST_CURSOR_BYTES {
+            Err(format!(
+                "list cursor must not exceed {MAX_LIST_CURSOR_BYTES} bytes"
+            ))
+        } else {
+            Ok(cursor)
+        }
+    })
+}
 
-                    let w_ws = snapshots
-                        .iter()
-                        .map(|e| e.workspace.len())
-                        .max()
-                        .unwrap_or(0)
-                        .max(hdr_ws.len());
-                    let w_snap = snapshots
-                        .iter()
-                        .map(|e| {
-                            if e.meta.missing {
-                                e.id.len() + " [MISSING]".len()
-                            } else {
-                                e.id.len()
-                            }
-                        })
-                        .max()
-                        .unwrap_or(0)
-                        .max(hdr_snap.len());
-                    let w_date = 19_usize.max(hdr_date.len()); // "YYYY-MM-DD HH:MM:SS"
+async fn handle_list_command<F, Fut>(
+    workspace: Option<String>,
+    limit: Option<u32>,
+    mut cursor: Option<String>,
+    format: &str,
+    mut send: F,
+) -> Result<()>
+where
+    F: FnMut(Request) -> Fut,
+    Fut: std::future::Future<Output = Result<Response>>,
+{
+    let single_page = limit.is_some() || cursor.is_some();
+    let limit = limit.unwrap_or(DEFAULT_LIST_PAGE_LIMIT);
+    let mut snapshots = Vec::new();
+    let mut seen_cursors = HashSet::new();
+    if let Some(cursor) = &cursor {
+        seen_cursors.insert(cursor.clone());
+    }
 
-                    println!(
-                        "{:<w_ws$} {:<w_snap$} {:<w_date$} {}",
-                        hdr_ws, hdr_snap, hdr_date, hdr_msg,
-                    );
-                    println!("{}", "-".repeat(w_ws + w_snap + w_date + hdr_msg.len() + 3));
-                    for entry in &snapshots {
-                        let id_display = if entry.meta.missing {
-                            format!("{} [MISSING]", entry.id)
-                        } else {
-                            entry.id.clone()
-                        };
-                        println!(
-                            "{:<w_ws$} {:<w_snap$} {:<w_date$} {}",
-                            entry.workspace,
-                            id_display,
-                            entry
-                                .meta
-                                .created_at
-                                .with_timezone(&chrono::Local)
-                                .format("%Y-%m-%d %H:%M:%S"),
-                            entry.meta.message.as_deref().unwrap_or("-"),
-                        );
-                    }
-                    println!("\nTotal: {} snapshot(s)", snapshots.len());
-                }
+    loop {
+        let response = send(Request::ListPage {
+            workspace: workspace.clone(),
+            limit,
+            cursor,
+        })
+        .await
+        .context("list: failed to fetch snapshot page")?;
+        let (page, next_cursor) = match response {
+            Response::ListPageOk {
+                snapshots,
+                next_cursor,
+            } => (snapshots, next_cursor),
+            Response::Error { code, message } => {
+                anyhow::bail!("list: daemon error [{code:?}]: {message}");
+            }
+            _ => anyhow::bail!("list: unexpected response; expected ListPageOk"),
+        };
+        if page.len() > limit as usize {
+            anyhow::bail!("list: invalid page exceeds requested limit {limit}");
+        }
+        if let Some(next) = &next_cursor {
+            if next.is_empty() || next.len() > MAX_LIST_CURSOR_BYTES {
+                anyhow::bail!("list: invalid continuation cursor length");
+            }
+            // Every continuation must carry entries, bounding cursor history by results.
+            if page.is_empty() {
+                anyhow::bail!("list: empty page with a continuation cursor makes no progress");
+            }
+            if !seen_cursors.insert(next.clone()) {
+                anyhow::bail!("list: repeated continuation cursor makes no progress");
             }
         }
-        Response::Error { code, message } => {
-            eprintln!("\x1b[31mError [{:?}]: {}\x1b[0m", code, message);
-            process::exit(1);
+        snapshots.extend(page);
+        cursor = next_cursor;
+        if single_page || cursor.is_none() {
+            break;
         }
-        _ => {
-            eprintln!("\x1b[33mUnexpected response type\x1b[0m");
+    }
+
+    // Do not expose partial success if any later page fails.
+    if format == "json" {
+        if single_page {
+            emit_json(serde_json::json!({
+                "snapshots": snapshots,
+                "next_cursor": cursor,
+            }));
+        } else {
+            emit_json(serde_json::to_value(&snapshots)?);
         }
+    } else {
+        write_list_table(
+            &mut io::stdout().lock(),
+            &snapshots,
+            single_page,
+            cursor.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
+fn write_list_table(
+    output: &mut impl Write,
+    snapshots: &[SnapshotEntry],
+    single_page: bool,
+    next_cursor: Option<&str>,
+) -> Result<()> {
+    if snapshots.is_empty() {
+        writeln!(output, "No snapshots found.")?;
+    } else {
+        // Dynamically compute column widths.
+        let hdr_ws = "WORKSPACE";
+        let hdr_snap = "SNAPSHOT";
+        let offset_secs = chrono::Local::now().offset().local_minus_utc();
+        let sign = if offset_secs >= 0 { '+' } else { '-' };
+        let h = offset_secs.abs() / 3600;
+        let m = (offset_secs.abs() % 3600) / 60;
+        let local_offset = if m == 0 {
+            format!("{sign}{h}")
+        } else {
+            format!("{sign}{h}:{m:02}")
+        };
+        let hdr_date = format!("CREATED (UTC{local_offset})");
+        let hdr_date = hdr_date.as_str();
+        let hdr_msg = "MESSAGE";
+
+        let w_ws = snapshots
+            .iter()
+            .map(|e| e.workspace.len())
+            .max()
+            .unwrap_or(0)
+            .max(hdr_ws.len());
+        let w_snap = snapshots
+            .iter()
+            .map(|e| {
+                if e.meta.missing {
+                    e.id.len() + " [MISSING]".len()
+                } else {
+                    e.id.len()
+                }
+            })
+            .max()
+            .unwrap_or(0)
+            .max(hdr_snap.len());
+        let w_date = 19_usize.max(hdr_date.len()); // "YYYY-MM-DD HH:MM:SS"
+
+        writeln!(
+            output,
+            "{:<w_ws$} {:<w_snap$} {:<w_date$} {}",
+            hdr_ws, hdr_snap, hdr_date, hdr_msg,
+        )?;
+        writeln!(
+            output,
+            "{}",
+            "-".repeat(w_ws + w_snap + w_date + hdr_msg.len() + 3)
+        )?;
+        for entry in snapshots {
+            let id_display = if entry.meta.missing {
+                format!("{} [MISSING]", entry.id)
+            } else {
+                entry.id.clone()
+            };
+            writeln!(
+                output,
+                "{:<w_ws$} {:<w_snap$} {:<w_date$} {}",
+                entry.workspace,
+                id_display,
+                entry
+                    .meta
+                    .created_at
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S"),
+                entry.meta.message.as_deref().unwrap_or("-"),
+            )?;
+        }
+    }
+    if single_page {
+        writeln!(output, "\nPage: {} snapshot(s)", snapshots.len())?;
+        writeln!(output, "Next cursor: {}", next_cursor.unwrap_or("(none)"))?;
+    } else if !snapshots.is_empty() {
+        writeln!(output, "\nTotal: {} snapshot(s)", snapshots.len())?;
     }
     Ok(())
 }
@@ -3026,9 +3134,16 @@ mod tests {
     fn parse_list() {
         let cli = Cli::try_parse_from(["ws-ckpt", "list", "--workspace", "/tmp/test"]).unwrap();
         match cli.command {
-            Commands::List { workspace, format } => {
+            Commands::List {
+                workspace,
+                limit,
+                cursor,
+                format,
+            } => {
                 assert_eq!(workspace.as_deref(), Some("/tmp/test"));
                 assert_eq!(format, "table"); // default
+                assert_eq!(limit, None);
+                assert_eq!(cursor, None);
             }
             _ => panic!("expected List"),
         }
@@ -3051,6 +3166,415 @@ mod tests {
             }
             _ => panic!("expected List"),
         }
+    }
+
+    #[test]
+    fn list_rejects_invalid_pagination_arguments() {
+        for limit in ["0", "1001", "4294967296", "-1", "abc", ""] {
+            assert!(Cli::try_parse_from(["ws-ckpt", "list", "--limit", limit]).is_err());
+        }
+        assert!(Cli::try_parse_from(["ws-ckpt", "list", "--limit"]).is_err());
+        assert!(Cli::try_parse_from(["ws-ckpt", "list", "--cursor"]).is_err());
+        for cursor in [
+            "a".repeat(MAX_LIST_CURSOR_BYTES + 1),
+            "é".repeat(MAX_LIST_CURSOR_BYTES / 2 + 1),
+        ] {
+            assert!(Cli::try_parse_from(["ws-ckpt", "list", "--cursor", &cursor]).is_err());
+        }
+    }
+
+    #[test]
+    fn list_accepts_pagination_boundaries() {
+        let cursor = "é".repeat(MAX_LIST_CURSOR_BYTES / 2);
+        for limit in [1, MAX_LIST_PAGE_LIMIT] {
+            let cli = Cli::try_parse_from([
+                "ws-ckpt",
+                "list",
+                "--limit",
+                &limit.to_string(),
+                "--cursor",
+                &cursor,
+            ])
+            .unwrap();
+            match cli.command {
+                Commands::List {
+                    limit: actual,
+                    cursor: actual_cursor,
+                    ..
+                } => {
+                    assert_eq!(actual, Some(limit));
+                    assert_eq!(actual_cursor.as_deref(), Some(cursor.as_str()));
+                }
+                _ => panic!("expected List"),
+            }
+        }
+    }
+
+    fn list_page(ids: &[&str], next_cursor: Option<&str>) -> Response {
+        Response::ListPageOk {
+            snapshots: ids
+                .iter()
+                .map(|id| SnapshotEntry {
+                    id: (*id).to_string(),
+                    workspace: "ws-test".to_string(),
+                    meta: ws_ckpt_common::SnapshotMeta {
+                        message: Some(format!("checkpoint {id}")),
+                        metadata: Some(serde_json::json!({"step": id})),
+                        pinned: false,
+                        created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                        missing: false,
+                        parent_id: None,
+                        child_ids: Vec::new(),
+                    },
+                })
+                .collect(),
+            next_cursor: next_cursor.map(str::to_string),
+        }
+    }
+
+    // Socket pairs exercise framed replies without a privileged daemon or global env changes.
+    async fn mock_list_exchange(request: Request, response: Option<Response>) -> Result<Response> {
+        let (mut client, mut server) = UnixStream::pair()?;
+        let frame = encode_frame(&request)?;
+        let serve = async move {
+            let mut len = [0; 4];
+            server.read_exact(&mut len).await?;
+            let mut payload = vec![0; u32::from_le_bytes(len) as usize];
+            server.read_exact(&mut payload).await?;
+            let received: Request = decode_payload(&payload)?;
+            assert_eq!(
+                serde_json::to_value(received)?,
+                serde_json::to_value(request)?
+            );
+            if let Some(response) = response {
+                server.write_all(&encode_frame(&response)?).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let receive = async move {
+            client.write_all(&frame).await?;
+            let mut len = [0; 4];
+            client.read_exact(&mut len).await?;
+            let len = u32::from_le_bytes(len);
+            assert!(len <= MAX_FRAME_SIZE);
+            let mut payload = vec![0; len as usize];
+            client.read_exact(&mut payload).await?;
+            Ok(decode_payload(&payload)?)
+        };
+        let (response, served) = tokio::join!(receive, serve);
+        served?;
+        response
+    }
+
+    async fn run_list_script(
+        args: &[&str],
+        replies: Vec<Option<Response>>,
+    ) -> (Result<()>, Vec<Request>, Option<serde_json::Value>) {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Commands::List {
+            workspace,
+            limit,
+            cursor,
+            format,
+        } = cli.command
+        else {
+            panic!("expected List");
+        };
+        take_json_output();
+        let mut replies = replies.into_iter();
+        let mut requests = Vec::new();
+        let result = handle_list_command(
+            workspace.as_deref().map(resolve_workspace_arg),
+            limit,
+            cursor,
+            &format,
+            |request| {
+                requests.push(request.clone());
+                mock_list_exchange(
+                    request,
+                    replies.next().expect("unexpected extra list request"),
+                )
+            },
+        )
+        .await;
+        assert!(
+            replies.next().is_none(),
+            "not all expected requests were sent"
+        );
+        (result, requests, take_json_output())
+    }
+
+    fn assert_list_request(
+        request: &Request,
+        workspace: Option<&str>,
+        limit: u32,
+        cursor: Option<&str>,
+    ) {
+        match request {
+            Request::ListPage {
+                workspace: actual_workspace,
+                limit: actual_limit,
+                cursor: actual_cursor,
+            } => {
+                assert_eq!(actual_workspace.as_deref(), workspace);
+                assert_eq!(*actual_limit, limit);
+                assert_eq!(actual_cursor.as_deref(), cursor);
+            }
+            _ => panic!("expected ListPage, never legacy List"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_default_aggregates_socket_pages_into_bare_array() {
+        let pages = vec![
+            list_page(&["a", "b"], Some("cursor-1")),
+            list_page(&["c"], None),
+        ];
+        let expected: Vec<SnapshotEntry> = pages
+            .iter()
+            .flat_map(|page| match page {
+                Response::ListPageOk { snapshots, .. } => snapshots.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let (result, requests, output) = run_list_script(
+            &["ws-ckpt", "list", "-w", "ws-test", "--format", "json"],
+            pages.into_iter().map(Some).collect(),
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_list_request(&requests[0], Some("ws-test"), DEFAULT_LIST_PAGE_LIMIT, None);
+        assert_list_request(
+            &requests[1],
+            Some("ws-test"),
+            DEFAULT_LIST_PAGE_LIMIT,
+            Some("cursor-1"),
+        );
+        assert_eq!(output.unwrap(), serde_json::to_value(expected).unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_explicit_flags_return_exactly_one_page_object() {
+        for (flags, limit, cursor) in [
+            (vec!["--limit", "1"], 1, None),
+            (
+                vec!["--cursor", "start"],
+                DEFAULT_LIST_PAGE_LIMIT,
+                Some("start"),
+            ),
+            (vec!["--limit", "1", "--cursor", "start"], 1, Some("start")),
+        ] {
+            let mut args = vec!["ws-ckpt", "list", "--format", "json"];
+            args.extend(flags);
+            let page = list_page(&["a"], Some("next"));
+            let Response::ListPageOk {
+                ref snapshots,
+                ref next_cursor,
+            } = page
+            else {
+                unreachable!()
+            };
+            let expected =
+                serde_json::json!({ "snapshots": snapshots, "next_cursor": next_cursor });
+            let (result, requests, output) = run_list_script(&args, vec![Some(page)]).await;
+            result.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_list_request(&requests[0], None, limit, cursor);
+            assert_eq!(output.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_empty_results_keep_full_and_page_json_shapes() {
+        for single_page in [false, true] {
+            let mut args = vec!["ws-ckpt", "list", "--format", "json"];
+            if single_page {
+                args.extend(["--limit", "1"]);
+            }
+            let (result, requests, output) =
+                run_list_script(&args, vec![Some(list_page(&[], None))]).await;
+            result.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                output.unwrap(),
+                if single_page {
+                    serde_json::json!({ "snapshots": [], "next_cursor": null })
+                } else {
+                    serde_json::json!([])
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_late_daemon_errors_leave_no_partial_json() {
+        for code in [
+            ErrorCode::InvalidListRequest,
+            ErrorCode::InvalidListCursor,
+            ErrorCode::ListEntryTooLarge,
+        ] {
+            let expected_code = format!("{code:?}");
+            let (result, requests, output) = run_list_script(
+                &["ws-ckpt", "list", "--format", "json"],
+                vec![
+                    Some(list_page(&["a"], Some("next"))),
+                    Some(Response::Error {
+                        code,
+                        message: "cannot continue listing".to_string(),
+                    }),
+                ],
+            )
+            .await;
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(&expected_code), "{error}");
+            assert!(error.contains("cannot continue listing"), "{error}");
+            assert_eq!(requests.len(), 2);
+            assert!(output.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_eof_is_not_retried_with_legacy_protocol() {
+        for replies in [
+            vec![None],
+            vec![Some(list_page(&["a"], Some("next"))), None],
+        ] {
+            let expected_calls = replies.len();
+            let (result, requests, output) =
+                run_list_script(&["ws-ckpt", "list", "--format", "json"], replies).await;
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("list: failed to fetch snapshot page"));
+            assert_eq!(requests.len(), expected_calls);
+            assert!(output.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_rejects_malformed_pages_without_success_output() {
+        let cases = vec![
+            (
+                vec![
+                    list_page(&["a"], Some("same")),
+                    list_page(&["b"], Some("same")),
+                ],
+                "repeated",
+            ),
+            (
+                vec![
+                    list_page(&["a"], Some("one")),
+                    list_page(&["b"], Some("two")),
+                    list_page(&["c"], Some("one")),
+                ],
+                "repeated",
+            ),
+            (vec![list_page(&[], Some("next"))], "empty page"),
+            (vec![list_page(&["a"], Some(""))], "cursor length"),
+            (
+                vec![list_page(
+                    &["a"],
+                    Some(&"x".repeat(MAX_LIST_CURSOR_BYTES + 1)),
+                )],
+                "cursor length",
+            ),
+            (
+                vec![Response::ListOk {
+                    snapshots: Vec::new(),
+                }],
+                "expected ListPageOk",
+            ),
+            (
+                vec![
+                    list_page(&["a"], Some("next")),
+                    Response::DeleteOk {
+                        target: "a".to_string(),
+                    },
+                ],
+                "expected ListPageOk",
+            ),
+        ];
+        for (pages, expected_error) in cases {
+            let (result, _, output) = run_list_script(
+                &["ws-ckpt", "list", "--format", "json"],
+                pages.into_iter().map(Some).collect(),
+            )
+            .await;
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(expected_error), "{error}");
+            assert!(output.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_single_page_rejects_oversized_page_or_unchanged_cursor() {
+        for (page, expected_error) in [
+            (list_page(&["a", "b"], None), "exceeds requested limit"),
+            (list_page(&["a"], Some("start")), "repeated"),
+        ] {
+            let (result, _, output) = run_list_script(
+                &[
+                    "ws-ckpt", "list", "--limit", "1", "--cursor", "start", "--format", "json",
+                ],
+                vec![Some(page)],
+            )
+            .await;
+            assert!(result.unwrap_err().to_string().contains(expected_error));
+            assert!(output.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_accepts_single_entry_above_page_target() {
+        let mut page = list_page(&["large"], None);
+        if let Response::ListPageOk { snapshots, .. } = &mut page {
+            snapshots[0].meta.message = Some("m".repeat(1024 * 1024 + 1));
+        }
+        let (result, _, output) = run_list_script(
+            &["ws-ckpt", "list", "--limit", "1", "--format", "json"],
+            vec![Some(page)],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(
+            output.unwrap()["snapshots"][0]["meta"]["message"]
+                .as_str()
+                .unwrap()
+                .len(),
+            1024 * 1024 + 1
+        );
+    }
+
+    #[test]
+    fn list_table_distinguishes_page_count_from_total() {
+        let Response::ListPageOk { mut snapshots, .. } = list_page(&["a"], None) else {
+            unreachable!()
+        };
+        snapshots[0].meta.missing = true;
+        for single_page in [false, true] {
+            let mut output = Vec::new();
+            write_list_table(&mut output, &snapshots, single_page, Some("next")).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("a [MISSING]"));
+            if single_page {
+                assert!(output.contains("Page: 1 snapshot(s)"));
+                assert!(output.contains("Next cursor: next"));
+                assert!(!output.contains("Total"));
+            } else {
+                assert!(output.contains("Total: 1 snapshot(s)"));
+                assert!(!output.contains("Next cursor"));
+            }
+        }
+        let mut output = Vec::new();
+        write_list_table(&mut output, &[], true, None).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "No snapshots found.\n\nPage: 0 snapshot(s)\nNext cursor: (none)\n"
+        );
+        let mut output = Vec::new();
+        write_list_table(&mut output, &[], false, None).unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "No snapshots found.\n");
     }
 
     #[test]
@@ -3150,8 +3674,15 @@ mod tests {
     fn list_without_workspace_parses_ok() {
         let cli = Cli::try_parse_from(["ws-ckpt", "list"]).unwrap();
         match cli.command {
-            Commands::List { workspace, format } => {
+            Commands::List {
+                workspace,
+                limit,
+                cursor,
+                format,
+            } => {
                 assert!(workspace.is_none());
+                assert_eq!(limit, None);
+                assert_eq!(cursor, None);
                 assert_eq!(format, "table");
             }
             _ => panic!("expected List"),

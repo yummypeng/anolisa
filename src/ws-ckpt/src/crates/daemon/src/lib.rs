@@ -11,6 +11,7 @@ mod recover_preview;
 pub mod scheduler;
 #[cfg(target_os = "linux")]
 pub mod seccomp;
+mod snapshot_list;
 pub mod snapshot_mgr;
 mod startup;
 pub mod state;

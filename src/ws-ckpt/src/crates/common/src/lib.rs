@@ -42,6 +42,15 @@ pub const GUARDED_CHECKPOINT_EVIDENCE_LIMIT_V2: usize = 256;
 /// Snapshot advisory threshold; strict-greater filter shared by daemon and CLI.
 pub const ADVISORY_SNAPSHOT_LIMIT: u32 = 1000;
 
+/// Default maximum entries requested per snapshot page.
+pub const DEFAULT_LIST_PAGE_LIMIT: u32 = 100;
+/// Largest accepted snapshot page entry limit.
+pub const MAX_LIST_PAGE_LIMIT: u32 = 1000;
+/// Preferred page payload budget; a larger single entry may use the frame limit.
+pub const LIST_PAGE_TARGET_BYTES: u64 = 1024 * 1024;
+/// Maximum UTF-8 byte length of an opaque snapshot-list cursor.
+pub const MAX_LIST_CURSOR_BYTES: usize = 8192;
+
 /// Sentinel in head snapshot's `child_ids` marking the writable subvolume.
 pub const LIVE_CHILD: &str = "__live__";
 
@@ -56,7 +65,7 @@ pub enum WsCkptError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("frame too large: {size} bytes (max {max})")]
-    FrameTooLarge { size: u32, max: u32 },
+    FrameTooLarge { size: u64, max: u32 },
     #[error("config error: {0}")]
     Config(String),
 }
@@ -199,6 +208,15 @@ pub enum Request {
     /// Recover only if the daemon's preview still describes the same target.
     RecoverConfirmed {
         preview: RecoveryPreview,
+    },
+    /// Read a byte-bounded page ordered by creation time, workspace ID, and snapshot ID.
+    ListPage {
+        /// Workspace path or ID; `None` selects all registered workspaces.
+        workspace: Option<String>,
+        /// Maximum entries, from one through [`MAX_LIST_PAGE_LIMIT`].
+        limit: u32,
+        /// Opaque continuation from the same query scope; `None` starts a traversal.
+        cursor: Option<String>,
     },
 }
 
@@ -373,6 +391,13 @@ pub enum Response {
     RecoverPreviewOk {
         preview: RecoveryPreview,
     },
+    /// A live page, not a frozen view of the index across requests.
+    ListPageOk {
+        /// Entries read on this page, including pinned and missing records.
+        snapshots: Vec<SnapshotEntry>,
+        /// Pass unchanged to continue; `None` means traversal is exhausted.
+        next_cursor: Option<String>,
+    },
 }
 
 /// Daemon-resolved recovery target; execution revalidates it under lifecycle locks.
@@ -403,6 +428,12 @@ pub enum ErrorCode {
     DiskSpaceInsufficient,
     CwdOccupied,
     CwdScanFailed,
+    /// A paginated list request has an unsupported entry limit.
+    InvalidListRequest,
+    /// A list cursor is malformed or belongs to a different query scope.
+    InvalidListCursor,
+    /// One snapshot and its continuation cannot fit in an IPC frame.
+    ListEntryTooLarge,
 }
 
 /// Opaque identity for one live writable-subvolume generation of a workspace.
@@ -1270,19 +1301,23 @@ impl Default for DaemonConfig {
 /// sides to prevent OOM from a malformed length prefix.
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024; // 16 MiB
 
+/// Measure a payload with the same encoding used by [`encode_frame`], without allocating its buffer.
+pub fn encoded_payload_size<T: Serialize + ?Sized>(msg: &T) -> Result<u64, WsCkptError> {
+    Ok(bincode::serialized_size(msg)?)
+}
+
 /// Serialize a message into a length-prefixed frame: [4-byte LE length][bincode payload]
 pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, WsCkptError> {
-    let payload = bincode::serialize(msg)?;
-    let len = payload.len() as u32;
-    if len > MAX_FRAME_SIZE {
+    let size = encoded_payload_size(msg)?;
+    if size > u64::from(MAX_FRAME_SIZE) {
         return Err(WsCkptError::FrameTooLarge {
-            size: len,
+            size,
             max: MAX_FRAME_SIZE,
         });
     }
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&len.to_le_bytes());
-    frame.extend(payload);
+    let mut frame = Vec::with_capacity(4 + size as usize);
+    frame.extend_from_slice(&(size as u32).to_le_bytes());
+    bincode::serialize_into(&mut frame, msg)?;
     Ok(frame)
 }
 
@@ -1875,6 +1910,9 @@ mod tests {
             ErrorCode::DiskSpaceInsufficient,
             ErrorCode::CwdOccupied,
             ErrorCode::CwdScanFailed,
+            ErrorCode::InvalidListRequest,
+            ErrorCode::InvalidListCursor,
+            ErrorCode::ListEntryTooLarge,
         ];
         for code in codes {
             let resp = Response::Error {
@@ -1919,6 +1957,90 @@ mod tests {
         let frame = encode_frame(&req).unwrap();
         let expected_payload = bincode::serialize(&req).unwrap();
         assert_eq!(&frame[4..], &expected_payload[..]);
+    }
+
+    #[test]
+    fn encode_frame_enforces_exact_payload_boundary() {
+        for size in [MAX_FRAME_SIZE - 1, MAX_FRAME_SIZE, MAX_FRAME_SIZE + 1] {
+            let message = "x".repeat(size as usize - 8);
+            assert_eq!(encoded_payload_size(&message).unwrap(), u64::from(size));
+            match encode_frame(&message) {
+                Ok(frame) => {
+                    assert!(size <= MAX_FRAME_SIZE);
+                    assert_eq!(frame.len(), size as usize + 4);
+                    assert_eq!(decode_payload::<String>(&frame[4..]).unwrap(), message);
+                }
+                Err(WsCkptError::FrameTooLarge { size: actual, max }) => {
+                    assert_eq!(size, MAX_FRAME_SIZE + 1);
+                    assert_eq!(actual, u64::from(size));
+                    assert_eq!(max, MAX_FRAME_SIZE);
+                }
+                other => panic!("unexpected encoding result: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn list_page_extensions_preserve_existing_wire_layout() {
+        let requests = [
+            Request::List {
+                workspace: Some("/ws".into()),
+                format: Some("json".into()),
+            },
+            Request::ListPage {
+                workspace: Some("/ws".into()),
+                limit: DEFAULT_LIST_PAGE_LIMIT,
+                cursor: Some("opaque".into()),
+            },
+        ];
+        for (request, tag) in requests.iter().zip([4_u32, 28]) {
+            let bytes = bincode::serialize(request).unwrap();
+            assert_eq!(&bytes[..4], &tag.to_le_bytes());
+            let decoded: Request = decode_payload(&bytes).unwrap();
+            assert_eq!(bincode::serialize(&decoded).unwrap(), bytes);
+        }
+        assert_eq!(
+            bincode::serialize(&requests[0]).unwrap(),
+            bincode::serialize(&(4_u32, Some("/ws"), Some("json"))).unwrap()
+        );
+        let responses = [
+            Response::ListOk { snapshots: vec![] },
+            Response::ListPageOk {
+                snapshots: vec![SnapshotEntry {
+                    id: "entry".into(),
+                    workspace: "/ws".into(),
+                    meta: SnapshotMeta {
+                        message: Some("checkpoint".into()),
+                        metadata: Some(serde_json::json!({"nested": [1, "value"]})),
+                        pinned: true,
+                        created_at: Utc::now(),
+                        missing: true,
+                        parent_id: None,
+                        child_ids: vec![],
+                    },
+                }],
+                next_cursor: Some("opaque".into()),
+            },
+        ];
+        for (response, tag) in responses.iter().zip([5_u32, 29]) {
+            let bytes = bincode::serialize(response).unwrap();
+            assert_eq!(&bytes[..4], &tag.to_le_bytes());
+            assert_eq!(encoded_payload_size(response).unwrap(), bytes.len() as u64);
+            let decoded: Response = decode_payload(&bytes).unwrap();
+            assert_eq!(bincode::serialize(&decoded).unwrap(), bytes);
+        }
+        assert_eq!(
+            bincode::serialize(&responses[0]).unwrap(),
+            bincode::serialize(&(5_u32, Vec::<SnapshotEntry>::new())).unwrap()
+        );
+        for (code, tag) in [
+            (ErrorCode::CwdScanFailed, 12_u32),
+            (ErrorCode::InvalidListRequest, 13),
+            (ErrorCode::InvalidListCursor, 14),
+            (ErrorCode::ListEntryTooLarge, 15),
+        ] {
+            assert_eq!(bincode::serialize(&code).unwrap(), tag.to_le_bytes());
+        }
     }
 
     // ── SnapshotIndex tests ──

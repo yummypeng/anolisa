@@ -61,6 +61,10 @@ async fn mock_server_handle(mut stream: tokio::net::UnixStream) {
             }],
         },
         Request::Delete { snapshot, .. } => Response::DeleteOk { target: snapshot },
+        Request::ListPage { .. } => Response::ListPageOk {
+            snapshots: vec![],
+            next_cursor: None,
+        },
         Request::List { .. } => Response::ListOk {
             snapshots: vec![SnapshotEntry {
                 id: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
