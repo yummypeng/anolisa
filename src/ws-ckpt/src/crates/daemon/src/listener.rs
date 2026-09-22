@@ -9,9 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::state::DaemonState;
-use ws_ckpt_common::{
-    decode_payload, encode_frame, ErrorCode, Request, Response, WsCkptError, MAX_FRAME_SIZE,
-};
+use ws_ckpt_common::{decode_payload, encode_frame, ErrorCode, Request, Response, MAX_FRAME_SIZE};
 
 pub async fn run_listener(
     state: Arc<DaemonState>,
@@ -130,22 +128,7 @@ async fn handle_connection(
     // Dispatch
     let context = crate::dispatcher::DispatchContext::new(peer_cred.map(|cred| cred.uid()));
     let mut response = crate::dispatcher::dispatch_with_context(&state, request, context).await;
-    let frame = match encode_frame(&response) {
-        Ok(frame) => frame,
-        Err(WsCkptError::FrameTooLarge { size, max })
-            if matches!(&response, Response::ListOk { .. }) =>
-        {
-            response = Response::Error {
-                code: ErrorCode::InternalError,
-                message: format!(
-                    "Snapshot list is too large ({size} bytes; maximum {max}); use ListPage or \
-                     ws-ckpt list --limit 100. Use status for snapshot counts."
-                ),
-            };
-            encode_frame(&response)?
-        }
-        Err(error) => return Err(error).context("Failed to encode response"),
-    };
+    let frame = encode_response(&mut response)?;
 
     if let Some(name) = ops_name {
         crate::ops_log::log_operation(name, &agent_name, &response);
@@ -157,6 +140,25 @@ async fn handle_connection(
         .context("Failed to write response")?;
 
     Ok(())
+}
+
+fn encode_response(response: &mut Response) -> anyhow::Result<Vec<u8>> {
+    match encode_frame(response) {
+        Ok(frame) => Ok(frame),
+        Err(error) => {
+            let advice = if matches!(response, Response::ListOk { .. }) {
+                "Use paginated listing or request snapshot counts."
+            } else {
+                "The request may already have completed; check its outcome before retrying."
+            };
+            *response = Response::Error {
+                // Legacy clients cannot decode newly appended error-code variants.
+                code: ErrorCode::InternalError,
+                message: format!("Failed to encode response: {error}. {advice}"),
+            };
+            encode_frame(response).context("Failed to encode error response")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -240,8 +242,9 @@ mod tests {
         match response {
             Response::Error { code, message } => {
                 assert_eq!(code, ErrorCode::InternalError);
-                assert!(message.contains("ListPage"));
-                assert!(message.contains("status"));
+                assert!(message.contains("paginated listing"));
+                assert!(message.contains("snapshot counts"));
+                assert!(!message.contains("ws-ckpt list"));
             }
             other => panic!("expected legacy-compatible error, got {other:?}"),
         }
@@ -285,24 +288,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_single_entry_returns_structured_page_error() {
-        let (_dir, state) = fixture(1, MAX_FRAME_SIZE as usize);
-        let response = exchange(
-            state,
-            Request::ListPage {
-                workspace: None,
-                limit: 1,
-                cursor: None,
-            },
-        )
-        .await;
+    async fn oversized_entries_return_summaries_and_continue_over_socket() {
+        let (_dir, state) = fixture(3, MAX_FRAME_SIZE as usize);
+        let mut cursor = None;
+        for i in 0..3 {
+            let response = exchange(
+                state.clone(),
+                Request::ListPage {
+                    workspace: None,
+                    limit: 100,
+                    cursor: cursor.clone(),
+                },
+            )
+            .await;
+            let Response::ListPageSummaryOk {
+                snapshot,
+                next_cursor,
+            } = response
+            else {
+                panic!("expected a summary page");
+            };
+            assert_eq!(snapshot.id, format!("snap-{i:04}"));
+            assert_eq!(next_cursor.is_none(), i == 2);
+            assert_ne!(cursor, next_cursor);
+            cursor = next_cursor;
+        }
         assert!(matches!(
-            response,
-            Response::Error {
-                code: ErrorCode::ListEntryTooLarge,
-                ..
-            }
+            exchange(state, Request::Config).await,
+            Response::ConfigOk { .. }
         ));
+    }
+
+    #[test]
+    fn oversized_non_list_responses_return_legacy_compatible_errors() {
+        use ws_ckpt_common::{ChangeType, DiffEntry, StatusReport, WorkspaceInfo};
+
+        for mut response in [
+            Response::DiffOk {
+                changes: vec![DiffEntry {
+                    path: "file".into(),
+                    change_type: ChangeType::Modified,
+                    detail: Some("x".repeat(MAX_FRAME_SIZE as usize)),
+                }],
+            },
+            Response::StatusOk {
+                report: StatusReport {
+                    uptime_secs: 0,
+                    workspaces: vec![WorkspaceInfo {
+                        ws_id: "ws-test".into(),
+                        path: "x".repeat(MAX_FRAME_SIZE as usize),
+                        snapshot_count: 0,
+                    }],
+                    fs_total_bytes: 0,
+                    fs_used_bytes: 0,
+                },
+            },
+            Response::Error {
+                code: ErrorCode::InternalError,
+                message: "x".repeat(MAX_FRAME_SIZE as usize),
+            },
+        ] {
+            let frame = encode_response(&mut response).unwrap();
+            assert!(frame.len() < 1024);
+            assert_eq!(u32::from_le_bytes(frame[4..8].try_into().unwrap()), 4);
+            assert_eq!(u32::from_le_bytes(frame[8..12].try_into().unwrap()), 7);
+            match decode_payload::<Response>(&frame[4..]).unwrap() {
+                Response::Error { code, message } => {
+                    assert_eq!(code, ErrorCode::InternalError);
+                    assert!(message.contains("frame too large"));
+                    assert!(message.contains(&MAX_FRAME_SIZE.to_string()));
+                    assert!(message.contains("may already have completed"));
+                }
+                other => panic!("expected structured error, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

@@ -1,5 +1,4 @@
-//! Stateless, bounded snapshot pages. Cursors are seek positions, not authorization
-//! or consistent snapshots: metadata and deletions are observed anew on each page.
+//! Seek pages reread metadata/deletions within a fixed upper key; later in-range inserts may appear.
 
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -7,8 +6,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use ws_ckpt_common::{
-    encoded_payload_size, ErrorCode, Response, SnapshotEntry, LIST_PAGE_TARGET_BYTES,
-    MAX_FRAME_SIZE, MAX_LIST_CURSOR_BYTES, MAX_LIST_PAGE_LIMIT,
+    encoded_payload_size, ErrorCode, Response, SnapshotEntry, SnapshotSummary, SnapshotSummaryMeta,
+    LIST_PAGE_TARGET_BYTES, MAX_FRAME_SIZE, MAX_LIST_CURSOR_BYTES, MAX_LIST_PAGE_LIMIT,
 };
 
 use crate::state::DaemonState;
@@ -145,7 +144,12 @@ async fn select_candidates(
         if !state.workspace_arc_is_current(&ws.ws_id, &arc) {
             continue;
         }
-        for (id, meta) in &ws.index.snapshots {
+        // Every page rescans the HashMap; bounded keys do not bound CPU or read-lock duration.
+        for (visited, (id, meta)) in ws.index.snapshots.iter().enumerate() {
+            if visited != 0 && visited % 4096 == 0 {
+                // Yield executor time, retaining the guard so concurrent writes cannot invalidate iteration.
+                tokio::task::yield_now().await;
+            }
             let parts = (meta.created_at, ws.ws_id.as_str(), id.as_str());
             let key = || Key {
                 created_at: meta.created_at,
@@ -173,6 +177,8 @@ async fn select_candidates(
                 }
             }
         }
+        drop(ws);
+        tokio::task::yield_now().await;
     }
     Candidates {
         keys: heap.into_sorted_vec(),
@@ -249,7 +255,32 @@ async fn collect_page(
                 return Ok(page(snapshots, next_cursor));
             }
             if total > u64::from(MAX_FRAME_SIZE) {
-                return Ok(entry_too_large(&key));
+                let summary_meta = SnapshotSummaryMeta {
+                    pinned: meta.pinned,
+                    created_at: meta.created_at,
+                    missing: meta.missing,
+                };
+                let envelope = Response::ListPageSummaryOk {
+                    snapshot: SnapshotSummary {
+                        id: String::new(),
+                        workspace: String::new(),
+                        meta: summary_meta,
+                    },
+                    next_cursor: candidate_cursor.clone(),
+                };
+                let summary_bytes =
+                    encoded_payload_size(&envelope)? + key.id.len() as u64 + workspace.len() as u64;
+                if summary_bytes > u64::from(MAX_FRAME_SIZE) {
+                    return Ok(entry_too_large(&key));
+                }
+                return Ok(Response::ListPageSummaryOk {
+                    snapshot: SnapshotSummary {
+                        id: key.id,
+                        workspace: workspace.into_owned(),
+                        meta: summary_meta,
+                    },
+                    next_cursor: candidate_cursor,
+                });
             }
             snapshots.push(SnapshotEntry {
                 id: key.id,
@@ -289,8 +320,9 @@ fn entry_too_large(key: &Key) -> Response {
     Response::Error {
         code: ErrorCode::ListEntryTooLarge,
         message: format!(
-            "snapshot {:?} in workspace {:?} cannot fit in a list response with its cursor; narrow the workspace scope or reduce its metadata",
-            key.id, key.ws_id
+            "snapshot identity/basic fields or its required cursor exceed the list budgets even without metadata (snapshot ID prefix {:?}, workspace ID prefix {:?}); no entry was skipped",
+            key.id.chars().take(128).collect::<String>(),
+            key.ws_id.chars().take(128).collect::<String>()
         ),
     }
 }

@@ -83,6 +83,18 @@ fn assert_error(response: Response, expected: ErrorCode) {
     }
 }
 
+fn unpack_summary(response: Response) -> (SnapshotSummary, Option<String>) {
+    assert!(encoded_payload_size(&response).unwrap() <= u64::from(MAX_FRAME_SIZE));
+    let frame = encode_frame(&response).unwrap();
+    match ws_ckpt_common::decode_payload(&frame[4..]).unwrap() {
+        Response::ListPageSummaryOk {
+            snapshot,
+            next_cursor,
+        } => (snapshot, next_cursor),
+        response => panic!("expected a summary page, got {response:?}"),
+    }
+}
+
 fn token(cursor: &Cursor) -> String {
     hex::encode(serde_json::to_vec(cursor).unwrap())
 }
@@ -451,10 +463,18 @@ async fn cursor_can_push_a_single_entry_over_the_frame_limit() {
     let fixture = Fixture::new();
     fixture.add_workspace("ws-a", entries(&["a", "z"]));
     set_first_entry_size(&fixture, u64::from(MAX_FRAME_SIZE) + 1).await;
-    assert_error(
-        fixture.list(None, 1, None).await,
-        ErrorCode::ListEntryTooLarge,
+    let (summary, cursor) = unpack_summary(fixture.list(None, 1, None).await);
+    assert_eq!(summary.id, "a");
+    assert_eq!(
+        Cursor::decode(cursor.as_ref().unwrap(), None)
+            .unwrap()
+            .after
+            .id,
+        "a"
     );
+    let (rest, cursor) = unpack(fixture.list(None, 1, cursor.as_deref()).await);
+    assert_eq!(rest[0].id, "z");
+    assert!(cursor.is_none());
     // The metadata itself fits; removing the need for a cursor makes it legal.
     {
         let arc = fixture.state.get_by_wsid("ws-a").unwrap();
@@ -468,7 +488,7 @@ async fn cursor_can_push_a_single_entry_over_the_frame_limit() {
 }
 
 #[tokio::test]
-async fn oversized_singletons_are_allowed_only_below_the_frame_limit() {
+async fn oversized_singletons_use_summaries_only_above_the_frame_limit() {
     for bytes in [2 * LIST_PAGE_TARGET_BYTES, u64::from(MAX_FRAME_SIZE) + 1] {
         let fixture = Fixture::new();
         let mut snapshot_meta = meta();
@@ -476,7 +496,9 @@ async fn oversized_singletons_are_allowed_only_below_the_frame_limit() {
         fixture.add_workspace("ws-a", [("a".into(), snapshot_meta)]);
         let response = fixture.list(None, 10, None).await;
         if bytes > u64::from(MAX_FRAME_SIZE) {
-            assert_error(response, ErrorCode::ListEntryTooLarge);
+            let (summary, cursor) = unpack_summary(response);
+            assert_eq!(summary.id, "a");
+            assert!(cursor.is_none());
         } else {
             assert!(encoded_payload_size(&response).unwrap() > LIST_PAGE_TARGET_BYTES);
             assert!(encoded_payload_size(&response).unwrap() <= u64::from(MAX_FRAME_SIZE));
@@ -504,10 +526,123 @@ async fn later_unframeable_entry_does_not_lose_the_preceding_page() {
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].id, "a");
     assert!(cursor.is_some());
-    assert_error(
-        fixture.list(None, 100, cursor.as_deref()).await,
-        ErrorCode::ListEntryTooLarge,
+    let (summary, next) = unpack_summary(fixture.list(None, 100, cursor.as_deref()).await);
+    assert_eq!(summary.id, "b");
+    assert_ne!(next, cursor);
+    assert_eq!(
+        Cursor::decode(next.as_ref().unwrap(), None)
+            .unwrap()
+            .after
+            .id,
+        "b"
     );
+    let (rest, cursor) = unpack(fixture.list(None, 100, next.as_deref()).await);
+    assert_eq!(
+        rest.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["c"]
+    );
+    assert!(cursor.is_none());
+}
+
+#[tokio::test]
+async fn summaries_preserve_identity_flags_and_index_for_every_large_field() {
+    let fixture = Fixture::new();
+    let mut oversized = meta();
+    oversized.pinned = true;
+    oversized.missing = true;
+    let large = "雪".repeat(MAX_FRAME_SIZE as usize / 3 + 1);
+    let mut metadata = oversized.clone();
+    metadata.metadata = Some(serde_json::json!({"value": large}));
+    let mut message = oversized.clone();
+    message.message = Some(large.clone());
+    let mut parent = oversized.clone();
+    parent.parent_id = Some(large.clone());
+    let mut children = oversized;
+    children.child_ids = vec![large];
+    let originals = [
+        ("a-metadata".into(), metadata),
+        ("b-message".into(), message),
+        ("c-parent".into(), parent),
+        ("d-children".into(), children),
+    ];
+    fixture.add_workspace("ws-a", originals.clone());
+    for scope in [None, Some("ws-a")] {
+        let mut cursor = None;
+        for (position, (id, original)) in originals.iter().enumerate() {
+            let (summary, next) = unpack_summary(fixture.list(scope, 100, cursor.as_deref()).await);
+            assert_eq!(&summary.id, id);
+            assert_eq!(summary.workspace, fixture.path("ws-a").to_string_lossy());
+            assert_eq!(summary.meta.created_at, original.created_at);
+            assert!(summary.meta.pinned);
+            assert!(summary.meta.missing);
+            assert_eq!(next.is_none(), position == originals.len() - 1);
+            if let Some(next) = &next {
+                assert_eq!(Cursor::decode(next, scope).unwrap().after.id, *id);
+                assert_ne!(Some(next), cursor.as_ref());
+            }
+            cursor = next;
+        }
+    }
+    let arc = fixture.state.get_by_wsid("ws-a").unwrap();
+    let ws = arc.read().await;
+    for (id, original) in originals {
+        assert_eq!(ws.index.snapshots[&id], original);
+    }
+}
+
+#[tokio::test]
+async fn summary_identity_and_cursor_budgets_still_fail_without_skipping() {
+    let fixture = Fixture::new();
+    let huge_id = "z".repeat(MAX_FRAME_SIZE as usize);
+    fixture.add_workspace("ws-a", [(huge_id, meta())]);
+    let response = fixture.list(None, 1, None).await;
+    assert!(encode_frame(&response).unwrap().len() < 2048);
+    assert_error(response, ErrorCode::ListEntryTooLarge);
+
+    let fixture = Fixture::new();
+    let huge_cursor_id = "z".repeat(MAX_LIST_CURSOR_BYTES);
+    fixture.add_workspace("ws-a", [("a".into(), meta()), (huge_cursor_id, meta())]);
+    for _ in 0..2 {
+        assert_error(
+            fixture.list(None, 1, None).await,
+            ErrorCode::ListEntryTooLarge,
+        );
+    }
+}
+
+#[tokio::test]
+async fn summary_budget_includes_identity_envelope_and_cursor() {
+    for continuation in [false, true] {
+        let fixture = Fixture::new();
+        let mut large = meta();
+        large.message = Some("x".repeat(MAX_FRAME_SIZE as usize));
+        let mut entries = vec![("a".into(), large)];
+        if continuation {
+            entries.push(("z".into(), meta()));
+        }
+        fixture.add_workspace("ws-a", entries);
+        let baseline = fixture.list(None, 1, None).await;
+        assert!(matches!(baseline, Response::ListPageSummaryOk { .. }));
+        let base = encoded_payload_size(&baseline).unwrap()
+            - fixture.path("ws-a").to_string_lossy().len() as u64;
+        let arc = fixture.state.get_by_wsid("ws-a").unwrap();
+        for extra in [0, 1] {
+            arc.write().await.index.workspace_path =
+                PathBuf::from("x".repeat((u64::from(MAX_FRAME_SIZE) - base + extra) as usize));
+            let response = fixture.list(None, 1, None).await;
+            if extra == 0 {
+                assert_eq!(
+                    encoded_payload_size(&response).unwrap(),
+                    u64::from(MAX_FRAME_SIZE)
+                );
+                let (summary, cursor) = unpack_summary(response);
+                assert_eq!(summary.id, "a");
+                assert_eq!(cursor.is_some(), continuation);
+            } else {
+                assert_error(response, ErrorCode::ListEntryTooLarge);
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -527,7 +662,7 @@ async fn metadata_flags_and_legacy_list_are_preserved() {
     };
     assert_eq!(
         crate::ops_log::ops_name_from_request(&request),
-        Some("list")
+        Some("list_page")
     );
     let response = crate::dispatcher::dispatch(&fixture.state, request).await;
     let (snapshots, cursor) = unpack(response);
@@ -545,6 +680,64 @@ async fn metadata_flags_and_legacy_list_are_preserved() {
         assert!(
             matches!(legacy, Response::ListOk { snapshots: legacy_entries } if legacy_entries == snapshots)
         );
+    }
+}
+
+#[tokio::test]
+async fn inserts_are_filtered_by_key_bounds_not_insertion_time() {
+    let fixture = Fixture::new();
+    fixture.add_workspace("ws-a", entries(&["a", "z"]));
+    let (_, cursor) = unpack(fixture.list(None, 1, None).await);
+    {
+        let arc = fixture.state.get_by_wsid("ws-a").unwrap();
+        let mut ws = arc.write().await;
+        for id in ["0", "m", "zz"] {
+            ws.index.snapshots.insert(id.into(), meta());
+        }
+    }
+    let (snapshots, next) = unpack(fixture.list(None, 10, cursor.as_deref()).await);
+    assert_eq!(
+        snapshots.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["m", "z"]
+    );
+    assert!(next.is_none());
+    let (snapshots, _) = unpack(fixture.list(None, 10, None).await);
+    assert_eq!(
+        snapshots.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["0", "a", "m", "z", "zz"]
+    );
+}
+
+#[tokio::test]
+async fn scan_yields_even_for_filtered_entries_without_releasing_its_iterator_guard() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let fixture = Fixture::new();
+    fixture.add_workspace("ws-a", (0..10_000).map(|id| (format!("{id:05}"), meta())));
+    let after = Key {
+        created_at: meta().created_at,
+        ws_id: "ws-a".into(),
+        id: "99999".into(),
+    };
+    let arc = fixture.state.get_by_wsid("ws-a").unwrap();
+    for boundary in [None, Some(&after)] {
+        let mut scan = std::pin::pin!(select_candidates(
+            &fixture.state,
+            Some("ws-a"),
+            boundary,
+            None,
+            2
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(scan.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(arc.try_write().is_err());
+        let selected = scan.await;
+        assert_eq!(selected.keys.len(), if boundary.is_some() { 0 } else { 2 });
+        assert!(arc.try_write().is_ok());
     }
 }
 

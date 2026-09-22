@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -12,9 +13,9 @@ use tokio::net::UnixStream;
 use ws_ckpt_common::{
     decode_payload, default_auto_cleanup_keep, encode_frame, load_config_file, save_config_file,
     ChangeType, CleanupRetention, DaemonConfig, ErrorCode, GlobalConfigJson, PolicyFieldOp,
-    RecoveryPreview, Request, Response, SnapshotEntry, WorkspacePolicyJson,
-    ADVISORY_SNAPSHOT_LIMIT, CONFIG_FILE_PATH, DEFAULT_AUTO_CLEANUP,
-    DEFAULT_AUTO_CLEANUP_INTERVAL_SECS, DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
+    RecoveryPreview, Request, Response, SnapshotEntry, SnapshotMeta, SnapshotSummary,
+    SnapshotSummaryMeta, WorkspacePolicyJson, ADVISORY_SNAPSHOT_LIMIT, CONFIG_FILE_PATH,
+    DEFAULT_AUTO_CLEANUP, DEFAULT_AUTO_CLEANUP_INTERVAL_SECS, DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
     DEFAULT_IMG_MAX_PERCENT, DEFAULT_IMG_SIZE_GB, DEFAULT_LIST_PAGE_LIMIT, DEFAULT_MOUNT_PATH,
     DEFAULT_SOCKET_PATH, GLOBAL_CONFIG_JSON_SCHEMA, MAX_FRAME_SIZE, MAX_LIST_CURSOR_BYTES,
     MAX_LIST_PAGE_LIMIT, OVERVIEW_JSON_SCHEMA,
@@ -201,6 +202,8 @@ enum Commands {
     },
 
     /// List snapshots for a workspace (or all workspaces if omitted)
+    ///
+    /// Oversized entries appear as summaries with omitted metadata fields identified.
     List {
         /// Workspace path or ID (optional; omit to list all workspaces)
         #[arg(long, short = 'w', value_parser = workspace_value_parser())]
@@ -515,7 +518,7 @@ async fn run(cli: Cli) -> Result<()> {
                 limit,
                 cursor,
                 &format,
-                |request| async move { send_request_to_daemon(&request).await },
+                |request| async move { try_send_request_to_daemon_silent(&request).await },
             )
             .await?;
         }
@@ -860,19 +863,19 @@ async fn try_send_request_to_daemon_silent(request: &Request) -> Result<Response
 
     let mut stream = UnixStream::connect(&socket_path)
         .await
-        .context("connect to daemon (silent)")?;
+        .context("failed to connect to ws-ckpt daemon")?;
 
     let frame = encode_frame(request)?;
     stream
         .write_all(&frame)
         .await
-        .context("send request (silent)")?;
+        .context("failed to send request")?;
 
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
         .await
-        .context("read response length (silent)")?;
+        .context("failed to read response length")?;
     let len = u32::from_le_bytes(len_buf);
     if len > MAX_FRAME_SIZE {
         anyhow::bail!(
@@ -885,7 +888,7 @@ async fn try_send_request_to_daemon_silent(request: &Request) -> Result<Response
     stream
         .read_exact(&mut payload)
         .await
-        .context("read response payload (silent)")?;
+        .context("failed to read response payload")?;
 
     let response: Response = decode_payload(&payload)?;
     Ok(response)
@@ -1092,6 +1095,130 @@ fn list_cursor_value_parser() -> impl TypedValueParser<Value = String> {
     })
 }
 
+const LIST_SUMMARY_OMITTED_FIELDS: [&str; 4] = ["message", "metadata", "parent_id", "child_ids"];
+
+// CLI output only: keep unavailable fields distinct from real nulls without changing IPC types.
+struct ListedSnapshot {
+    id: String,
+    workspace: String,
+    fields: ListedSnapshotFields,
+}
+
+enum ListedSnapshotFields {
+    Full(SnapshotMeta),
+    Summary(SnapshotSummaryMeta),
+}
+
+impl From<SnapshotEntry> for ListedSnapshot {
+    fn from(entry: SnapshotEntry) -> Self {
+        Self {
+            id: entry.id,
+            workspace: entry.workspace,
+            fields: ListedSnapshotFields::Full(entry.meta),
+        }
+    }
+}
+
+impl From<SnapshotSummary> for ListedSnapshot {
+    fn from(summary: SnapshotSummary) -> Self {
+        Self {
+            id: summary.id,
+            workspace: summary.workspace,
+            fields: ListedSnapshotFields::Summary(summary.meta),
+        }
+    }
+}
+
+impl ListedSnapshot {
+    fn into_json(self) -> Result<serde_json::Value> {
+        match self.fields {
+            // Preserve the existing full-entry serializer, including real null/empty values.
+            ListedSnapshotFields::Full(meta) => Ok(serde_json::to_value(SnapshotEntry {
+                id: self.id,
+                workspace: self.workspace,
+                meta,
+            })?),
+            ListedSnapshotFields::Summary(meta) => Ok(serde_json::json!({
+                "id": self.id,
+                "workspace": self.workspace,
+                "detail": "summary",
+                "omitted_fields": LIST_SUMMARY_OMITTED_FIELDS,
+                "meta": meta,
+            })),
+        }
+    }
+
+    fn table_meta(&self) -> SnapshotSummaryMeta {
+        match &self.fields {
+            ListedSnapshotFields::Full(meta) => SnapshotSummaryMeta {
+                pinned: meta.pinned,
+                created_at: meta.created_at,
+                missing: meta.missing,
+            },
+            ListedSnapshotFields::Summary(meta) => *meta,
+        }
+    }
+
+    fn id_display(&self) -> String {
+        let mut id = self.id.clone();
+        if self.table_meta().missing {
+            id.push_str(" [MISSING]");
+        }
+        if matches!(&self.fields, ListedSnapshotFields::Summary(_)) {
+            id.push_str(" [SUMMARY]");
+        }
+        id
+    }
+}
+
+async fn fetch_list_page<F, Fut>(
+    send: &mut F,
+    workspace: Option<String>,
+    limit: u32,
+    cursor: Option<String>,
+    has_accepted_page: bool,
+) -> Result<Response>
+where
+    F: FnMut(Request) -> Fut,
+    Fut: std::future::Future<Output = Result<Response>>,
+{
+    let mut retries = 0;
+    loop {
+        let result = send(Request::ListPage {
+            workspace: workspace.clone(),
+            limit,
+            cursor: cursor.clone(),
+        })
+        .await;
+        match result {
+            Err(error)
+                if retries < 3
+                    && error.downcast_ref::<io::Error>().is_some_and(|error| {
+                        match error.kind() {
+                            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                                has_accepted_page
+                            }
+                            io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::NotConnected
+                            | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                            | io::ErrorKind::WriteZero => true,
+                            _ => false,
+                        }
+                    }) =>
+            {
+                // Only this read-only RPC may replay a cursor; completed pages are never replayed.
+                tokio::time::sleep(std::time::Duration::from_millis(100 << retries)).await;
+                retries += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 async fn handle_list_command<F, Fut>(
     workspace: Option<String>,
     limit: Option<u32>,
@@ -1111,55 +1238,123 @@ where
         seen_cursors.insert(cursor.clone());
     }
 
-    loop {
-        let response = send(Request::ListPage {
-            workspace: workspace.clone(),
-            limit,
-            cursor,
-        })
-        .await
-        .context("list: failed to fetch snapshot page")?;
-        let (page, next_cursor) = match response {
-            Response::ListPageOk {
-                snapshots,
-                next_cursor,
-            } => (snapshots, next_cursor),
-            Response::Error { code, message } => {
-                anyhow::bail!("list: daemon error [{code:?}]: {message}");
+    let result: Result<()> = async {
+        loop {
+            let response = fetch_list_page(
+                &mut send,
+                workspace.clone(),
+                limit,
+                cursor.clone(),
+                !snapshots.is_empty(),
+            )
+            .await
+            .context("list: failed to fetch snapshot page")?;
+            let (page, next_cursor): (Vec<ListedSnapshot>, _) = match response {
+                Response::ListPageOk {
+                    snapshots,
+                    next_cursor,
+                } => (
+                    snapshots.into_iter().map(ListedSnapshot::from).collect(),
+                    next_cursor,
+                ),
+                Response::ListPageSummaryOk {
+                    snapshot,
+                    next_cursor,
+                } => (vec![snapshot.into()], next_cursor),
+                Response::Error { code, message } => {
+                    anyhow::bail!("list: daemon error [{code:?}]: {message}");
+                }
+                _ => anyhow::bail!(
+                    "list: unexpected response; expected ListPageOk or ListPageSummaryOk"
+                ),
+            };
+            if page.len() > limit as usize {
+                anyhow::bail!("list: invalid page exceeds requested limit {limit}");
             }
-            _ => anyhow::bail!("list: unexpected response; expected ListPageOk"),
-        };
-        if page.len() > limit as usize {
-            anyhow::bail!("list: invalid page exceeds requested limit {limit}");
-        }
-        if let Some(next) = &next_cursor {
-            if next.is_empty() || next.len() > MAX_LIST_CURSOR_BYTES {
-                anyhow::bail!("list: invalid continuation cursor length");
+            if let Some(next) = &next_cursor {
+                if next.is_empty() || next.len() > MAX_LIST_CURSOR_BYTES {
+                    anyhow::bail!("list: invalid continuation cursor length");
+                }
+                // Every continuation must carry entries, bounding cursor history by results.
+                if page.is_empty() {
+                    anyhow::bail!("list: empty page with a continuation cursor makes no progress");
+                }
+                if !seen_cursors.insert(next.clone()) {
+                    anyhow::bail!("list: repeated continuation cursor makes no progress");
+                }
             }
-            // Every continuation must carry entries, bounding cursor history by results.
-            if page.is_empty() {
-                anyhow::bail!("list: empty page with a continuation cursor makes no progress");
+            snapshots.extend(page);
+            cursor = next_cursor;
+            if single_page || cursor.is_none() {
+                return Ok(());
             }
-            if !seen_cursors.insert(next.clone()) {
-                anyhow::bail!("list: repeated continuation cursor makes no progress");
-            }
-        }
-        snapshots.extend(page);
-        cursor = next_cursor;
-        if single_page || cursor.is_none() {
-            break;
         }
     }
+    .await;
+    if let Err(error) = result {
+        let daemon_unavailable = error.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            )
+        });
+        let error = if daemon_unavailable {
+            error.context(
+                "Cannot connect to ws-ckpt daemon. Start the systemd service `ws-ckpt`, or its daemon container.",
+            )
+        } else {
+            error
+        };
+        if daemon_unavailable && snapshots.is_empty() {
+            return Err(if cursor.is_some() {
+                error.context(format!(
+                    "list could not start; workspace={}; limit={limit}; resume_cursor={}. \
+                     Retry with the same workspace and cursor.",
+                    serde_json::to_string(&workspace)?,
+                    serde_json::to_string(&cursor)?,
+                ))
+            } else {
+                error
+            });
+        }
+        let error = error.context(format!(
+            "list incomplete after {} accepted snapshot(s); workspace={}; limit={limit}; \
+             resume_cursor={}. Resume with the same workspace and this cursor after resolving \
+             the error; this retrieves only the remainder, not the withheld JSON prefix. \
+             A null cursor means restart from the first page.",
+            snapshots.len(),
+            serde_json::to_string(&workspace)?,
+            serde_json::to_string(&cursor)?,
+        ));
+        if format != "json" && !snapshots.is_empty() {
+            if let Err(output_error) = write_list_table(
+                &mut io::stdout().lock(),
+                &snapshots,
+                true,
+                cursor.as_deref(),
+                true,
+            ) {
+                return Err(error.context(format!(
+                    "partial table output also failed: {output_error:#}"
+                )));
+            }
+        }
+        return Err(error);
+    }
 
-    // Do not expose partial success if any later page fails.
+    // JSON remains atomic; incomplete tables are explicitly labeled and exit nonzero.
     if format == "json" {
+        let snapshots = snapshots
+            .into_iter()
+            .map(ListedSnapshot::into_json)
+            .collect::<Result<Vec<_>>>()?;
         if single_page {
             emit_json(serde_json::json!({
                 "snapshots": snapshots,
                 "next_cursor": cursor,
             }));
         } else {
-            emit_json(serde_json::to_value(&snapshots)?);
+            emit_json(serde_json::Value::Array(snapshots));
         }
     } else {
         write_list_table(
@@ -1167,6 +1362,7 @@ where
             &snapshots,
             single_page,
             cursor.as_deref(),
+            false,
         )?;
     }
     Ok(())
@@ -1174,10 +1370,17 @@ where
 
 fn write_list_table(
     output: &mut impl Write,
-    snapshots: &[SnapshotEntry],
+    snapshots: &[ListedSnapshot],
     single_page: bool,
     next_cursor: Option<&str>,
+    incomplete: bool,
 ) -> Result<()> {
+    if incomplete {
+        writeln!(
+            output,
+            "INCOMPLETE: listing stopped; only accepted pages are shown."
+        )?;
+    }
     if snapshots.is_empty() {
         writeln!(output, "No snapshots found.")?;
     } else {
@@ -1205,13 +1408,7 @@ fn write_list_table(
             .max(hdr_ws.len());
         let w_snap = snapshots
             .iter()
-            .map(|e| {
-                if e.meta.missing {
-                    e.id.len() + " [MISSING]".len()
-                } else {
-                    e.id.len()
-                }
-            })
+            .map(|e| e.id_display().len())
             .max()
             .unwrap_or(0)
             .max(hdr_snap.len());
@@ -1228,27 +1425,32 @@ fn write_list_table(
             "-".repeat(w_ws + w_snap + w_date + hdr_msg.len() + 3)
         )?;
         for entry in snapshots {
-            let id_display = if entry.meta.missing {
-                format!("{} [MISSING]", entry.id)
-            } else {
-                entry.id.clone()
+            let message = match &entry.fields {
+                ListedSnapshotFields::Full(meta) => {
+                    Cow::Borrowed(meta.message.as_deref().unwrap_or("-"))
+                }
+                ListedSnapshotFields::Summary(_) => Cow::Owned(format!(
+                    "omitted meta fields: {}",
+                    LIST_SUMMARY_OMITTED_FIELDS.join(", ")
+                )),
             };
             writeln!(
                 output,
                 "{:<w_ws$} {:<w_snap$} {:<w_date$} {}",
                 entry.workspace,
-                id_display,
+                entry.id_display(),
                 entry
-                    .meta
+                    .table_meta()
                     .created_at
                     .with_timezone(&chrono::Local)
                     .format("%Y-%m-%d %H:%M:%S"),
-                entry.meta.message.as_deref().unwrap_or("-"),
+                message,
             )?;
         }
     }
-    if single_page {
-        writeln!(output, "\nPage: {} snapshot(s)", snapshots.len())?;
+    if single_page || incomplete {
+        let label = if incomplete { "Partial" } else { "Page" };
+        writeln!(output, "\n{label}: {} snapshot(s)", snapshots.len())?;
         writeln!(output, "Next cursor: {}", next_cursor.unwrap_or("(none)"))?;
     } else if !snapshots.is_empty() {
         writeln!(output, "\nTotal: {} snapshot(s)", snapshots.len())?;
@@ -3232,6 +3434,21 @@ mod tests {
         }
     }
 
+    fn list_summary_page(id: &str, next_cursor: Option<&str>) -> Response {
+        Response::ListPageSummaryOk {
+            snapshot: SnapshotSummary {
+                id: id.to_string(),
+                workspace: "ws-test".to_string(),
+                meta: SnapshotSummaryMeta {
+                    pinned: true,
+                    created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                    missing: true,
+                },
+            },
+            next_cursor: next_cursor.map(str::to_string),
+        }
+    }
+
     // Socket pairs exercise framed replies without a privileged daemon or global env changes.
     async fn mock_list_exchange(request: Request, response: Option<Response>) -> Result<Response> {
         let (mut client, mut server) = UnixStream::pair()?;
@@ -3355,6 +3572,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_aggregates_full_summary_full_without_changing_full_entries() {
+        let Response::ListPageOk {
+            snapshots: full, ..
+        } = list_page(&["a", "c"], None)
+        else {
+            unreachable!()
+        };
+        let expected = serde_json::json!([
+            full[0],
+            {
+                "id": "b",
+                "workspace": "ws-test",
+                "detail": "summary",
+                "omitted_fields": ["message", "metadata", "parent_id", "child_ids"],
+                "meta": {
+                    "pinned": true,
+                    "created_at": "2023-11-14T22:13:20Z",
+                    "missing": true,
+                },
+            },
+            full[1],
+        ]);
+        let (result, requests, output) = run_list_script(
+            &["ws-ckpt", "list", "-w", "ws-test", "--format", "json"],
+            vec![
+                Some(list_page(&["a"], Some("cursor-a"))),
+                Some(list_summary_page("b", Some("cursor-b"))),
+                Some(list_page(&["c"], None)),
+            ],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(output.unwrap(), expected);
+        assert_eq!(requests.len(), 3);
+        for (request, cursor) in requests
+            .iter()
+            .zip([None, Some("cursor-a"), Some("cursor-b")])
+        {
+            assert_list_request(request, Some("ws-test"), DEFAULT_LIST_PAGE_LIMIT, cursor);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_traverses_consecutive_and_terminal_summaries() {
+        let ids = ["a", "b", "c"];
+        for count in [1, ids.len()] {
+            let ids = &ids[..count];
+            let pages = ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| Some(list_summary_page(id, ids.get(index + 1).copied())))
+                .collect();
+            let (result, requests, output) =
+                run_list_script(&["ws-ckpt", "list", "--format", "json"], pages).await;
+            result.unwrap();
+            assert_eq!(requests.len(), count);
+            let output = output.unwrap();
+            let entries = output.as_array().unwrap();
+            assert_eq!(entries.len(), count);
+            for (index, id) in ids.iter().enumerate() {
+                assert_eq!(entries[index]["id"], *id);
+                assert_eq!(entries[index]["detail"], "summary");
+                assert_list_request(
+                    &requests[index],
+                    None,
+                    DEFAULT_LIST_PAGE_LIMIT,
+                    (index != 0).then_some(*id),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_explicit_flags_return_exactly_one_summary_page() {
+        for (flags, limit, cursor) in [
+            (vec!["--limit", "1"], 1, None),
+            (
+                vec!["--cursor", "start"],
+                DEFAULT_LIST_PAGE_LIMIT,
+                Some("start"),
+            ),
+            (vec!["--limit", "1", "--cursor", "start"], 1, Some("start")),
+        ] {
+            let mut args = vec!["ws-ckpt", "list", "--format", "json"];
+            args.extend(flags);
+            for next_cursor in [Some("next"), None] {
+                let (result, requests, output) =
+                    run_list_script(&args, vec![Some(list_summary_page("large", next_cursor))])
+                        .await;
+                result.unwrap();
+                assert_eq!(requests.len(), 1);
+                assert_list_request(&requests[0], None, limit, cursor);
+                let output = output.unwrap();
+                assert_eq!(output.as_object().unwrap().len(), 2);
+                assert_eq!(output["snapshots"].as_array().unwrap().len(), 1);
+                assert_eq!(output["snapshots"][0]["id"], "large");
+                assert_eq!(output["snapshots"][0]["detail"], "summary");
+                assert_eq!(output["next_cursor"], serde_json::json!(next_cursor));
+            }
+        }
+    }
+
+    #[test]
+    fn list_summary_omissions_are_distinct_from_full_nulls_and_empty_fields() {
+        let Response::ListPageOk { mut snapshots, .. } = list_page(&["full"], None) else {
+            unreachable!()
+        };
+        let mut entry = snapshots.remove(0);
+        entry.meta.message = None;
+        entry.meta.metadata = None;
+        let expected = serde_json::to_value(&entry).unwrap();
+        let full = ListedSnapshot::from(entry).into_json().unwrap();
+        assert_eq!(full, expected);
+        assert_eq!(
+            serde_json::to_vec(&full).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        for field in ["message", "metadata", "parent_id"] {
+            assert_eq!(full["meta"].get(field), Some(&serde_json::Value::Null));
+        }
+        assert_eq!(full["meta"].get("child_ids"), Some(&serde_json::json!([])));
+        assert!(full.get("detail").is_none());
+        assert!(full.get("omitted_fields").is_none());
+
+        let Response::ListPageSummaryOk { snapshot, .. } = list_summary_page("summary", None)
+        else {
+            unreachable!()
+        };
+        let summary = ListedSnapshot::from(snapshot).into_json().unwrap();
+        assert_eq!(summary["detail"], "summary");
+        assert_eq!(
+            summary["omitted_fields"],
+            serde_json::json!(["message", "metadata", "parent_id", "child_ids"])
+        );
+        for field in ["message", "metadata", "parent_id", "child_ids"] {
+            assert!(
+                summary["meta"].get(field).is_none(),
+                "{field} must be absent, not null"
+            );
+            assert!(summary.get(field).is_none());
+        }
+        assert_eq!(summary["meta"].as_object().unwrap().len(), 3);
+        assert_eq!(summary["meta"]["pinned"], true);
+        assert_eq!(summary["meta"]["missing"], true);
+        assert_eq!(summary["meta"]["created_at"], "2023-11-14T22:13:20Z");
+    }
+
+    #[tokio::test]
     async fn list_explicit_flags_return_exactly_one_page_object() {
         for (flags, limit, cursor) in [
             (vec!["--limit", "1"], 1, None),
@@ -3426,29 +3791,324 @@ mod tests {
                 ],
             )
             .await;
-            let error = result.unwrap_err().to_string();
+            let error = format!("{:#}", result.unwrap_err());
             assert!(error.contains(&expected_code), "{error}");
             assert!(error.contains("cannot continue listing"), "{error}");
+            assert!(error.contains("after 1 accepted snapshot(s)"), "{error}");
+            assert!(error.contains("resume_cursor=\"next\""), "{error}");
             assert_eq!(requests.len(), 2);
             assert!(output.is_none());
         }
     }
 
     #[tokio::test]
-    async fn list_eof_is_not_retried_with_legacy_protocol() {
-        for replies in [
-            vec![None],
-            vec![Some(list_page(&["a"], Some("next"))), None],
-        ] {
+    async fn list_eof_retries_are_bounded_without_legacy_fallback() {
+        for late_failure in [false, true] {
+            let mut replies = Vec::new();
+            if late_failure {
+                replies.push(Some(list_page(&["a"], Some("next"))));
+            }
+            replies.extend([None, None, None, None]);
             let expected_calls = replies.len();
             let (result, requests, output) =
                 run_list_script(&["ws-ckpt", "list", "--format", "json"], replies).await;
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("list: failed to fetch snapshot page"));
+            assert!(error.contains(if late_failure {
+                "resume_cursor=\"next\""
+            } else {
+                "resume_cursor=null"
+            }));
+            assert_eq!(requests.len(), expected_calls);
+            for request in &requests[usize::from(late_failure)..] {
+                assert_list_request(
+                    request,
+                    None,
+                    DEFAULT_LIST_PAGE_LIMIT,
+                    late_failure.then_some("next"),
+                );
+            }
+            assert!(output.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_recovers_after_eof_without_duplicating_accepted_entries() {
+        let (result, requests, output) = run_list_script(
+            &["ws-ckpt", "list", "-w", "ws-test", "--format", "json"],
+            vec![
+                Some(list_page(&["a"], Some("next"))),
+                None,
+                None,
+                Some(list_page(&["b"], None)),
+            ],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(requests.len(), 4);
+        for request in &requests[1..] {
+            assert_list_request(
+                request,
+                Some("ws-test"),
+                DEFAULT_LIST_PAGE_LIMIT,
+                Some("next"),
+            );
+        }
+        let output = output.unwrap();
+        assert_eq!(output.as_array().unwrap().len(), 2);
+        assert_eq!(output[0]["id"], "a");
+        assert_eq!(output[1]["id"], "b");
+    }
+
+    #[tokio::test]
+    async fn list_summaries_survive_retries_without_duplicate_acceptance() {
+        let (result, requests, output) = run_list_script(
+            &["ws-ckpt", "list", "-w", "ws-test", "--format", "json"],
+            vec![
+                Some(list_page(&["a"], Some("cursor-a"))),
+                None,
+                Some(list_summary_page("b", Some("cursor-b"))),
+                None,
+                None,
+                Some(list_summary_page("c", None)),
+            ],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(requests.len(), 6);
+        assert_list_request(&requests[0], Some("ws-test"), DEFAULT_LIST_PAGE_LIMIT, None);
+        for request in &requests[1..3] {
+            assert_list_request(
+                request,
+                Some("ws-test"),
+                DEFAULT_LIST_PAGE_LIMIT,
+                Some("cursor-a"),
+            );
+        }
+        for request in &requests[3..] {
+            assert_list_request(
+                request,
+                Some("ws-test"),
+                DEFAULT_LIST_PAGE_LIMIT,
+                Some("cursor-b"),
+            );
+        }
+        let output = output.unwrap();
+        let entries = output.as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        for (entry, id) in entries.iter().zip(["a", "b", "c"]) {
+            assert_eq!(entry["id"], id);
+        }
+        assert!(entries[0].get("detail").is_none());
+        assert_eq!(entries[1]["detail"], "summary");
+        assert_eq!(entries[2]["detail"], "summary");
+    }
+
+    #[tokio::test]
+    async fn list_late_error_after_summary_keeps_safe_continuation() {
+        for format in ["json", "table"] {
+            let (result, requests, output) = run_list_script(
+                &["ws-ckpt", "list", "-w", "ws-test", "--format", format],
+                vec![
+                    Some(list_page(&["a"], Some("before-summary"))),
+                    Some(list_summary_page("large", Some("after-summary"))),
+                    Some(Response::Error {
+                        code: ErrorCode::InvalidListCursor,
+                        message: "cannot continue listing".to_string(),
+                    }),
+                ],
+            )
+            .await;
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("InvalidListCursor"), "{error}");
+            assert!(error.contains("after 2 accepted snapshot(s)"), "{error}");
+            assert!(error.contains("workspace=\"ws-test\""), "{error}");
+            assert!(error.contains("resume_cursor=\"after-summary\""), "{error}");
+            assert_eq!(requests.len(), 3);
+            assert_list_request(
+                &requests[2],
+                Some("ws-test"),
+                DEFAULT_LIST_PAGE_LIMIT,
+                Some("after-summary"),
+            );
+            assert!(output.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_retries_typed_connection_errors_but_not_permanent_errors() {
+        for (kind, expected_calls) in [
+            (io::ErrorKind::NotFound, 1),
+            (io::ErrorKind::ConnectionRefused, 1),
+            (io::ErrorKind::ConnectionReset, 4),
+            (io::ErrorKind::ConnectionAborted, 4),
+            (io::ErrorKind::NotConnected, 4),
+            (io::ErrorKind::BrokenPipe, 4),
+            (io::ErrorKind::UnexpectedEof, 4),
+            (io::ErrorKind::TimedOut, 4),
+            (io::ErrorKind::Interrupted, 4),
+            (io::ErrorKind::WriteZero, 4),
+            (io::ErrorKind::PermissionDenied, 1),
+            (io::ErrorKind::InvalidData, 1),
+        ] {
+            let mut calls = 0;
+            let result = handle_list_command(
+                Some("ws-test".into()),
+                Some(1),
+                Some("start".into()),
+                "json",
+                |request| {
+                    calls += 1;
+                    assert_list_request(&request, Some("ws-test"), 1, Some("start"));
+                    std::future::ready(Err(anyhow::Error::new(io::Error::new(kind, "test"))
+                        .context("transport failed")))
+                },
+            )
+            .await;
+            assert_eq!(calls, expected_calls);
             assert!(result
                 .unwrap_err()
                 .to_string()
-                .contains("list: failed to fetch snapshot page"));
-            assert_eq!(requests.len(), expected_calls);
-            assert!(output.is_none());
+                .contains("resume_cursor=\"start\""));
+        }
+    }
+
+    #[tokio::test]
+    async fn list_initial_unavailable_daemon_fails_fast_with_guidance() {
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
+            for cursor in [None, Some("start\"\\\n")] {
+                for format in ["json", "table"] {
+                    take_json_output();
+                    let mut calls = 0;
+                    let error = handle_list_command(
+                        Some("ws-test".into()),
+                        None,
+                        cursor.map(str::to_string),
+                        format,
+                        |request| {
+                            calls += 1;
+                            assert_list_request(
+                                &request,
+                                Some("ws-test"),
+                                DEFAULT_LIST_PAGE_LIMIT,
+                                cursor,
+                            );
+                            std::future::ready(Err(anyhow::Error::new(io::Error::new(
+                                kind, "test",
+                            ))
+                            .context("failed to connect to ws-ckpt daemon")))
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(calls, 1);
+                    assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
+                    let error = format!("{error:#}");
+                    assert!(
+                        error.contains("Cannot connect to ws-ckpt daemon"),
+                        "{error}"
+                    );
+                    assert!(
+                        error.contains(
+                            "Start the systemd service `ws-ckpt`, or its daemon container."
+                        ),
+                        "{error}"
+                    );
+                    assert!(!error.contains("list incomplete"), "{error}");
+                    assert!(!error.contains("withheld JSON prefix"), "{error}");
+                    if cursor.is_some() {
+                        assert!(error.contains("workspace=\"ws-test\""), "{error}");
+                        assert!(
+                            error.contains(&format!("limit={DEFAULT_LIST_PAGE_LIMIT}")),
+                            "{error}"
+                        );
+                        assert!(
+                            error.contains(&format!(
+                                "resume_cursor={}",
+                                serde_json::to_string(&cursor).unwrap()
+                            )),
+                            "{error}"
+                        );
+                        assert!(
+                            error.contains("Retry with the same workspace and cursor"),
+                            "{error}"
+                        );
+                    } else {
+                        assert!(!error.contains("resume_cursor"), "{error}");
+                    }
+                    assert!(take_json_output().is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_late_unavailable_daemon_preserves_retries_and_progress() {
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
+            for summary in [false, true] {
+                for recover in [false, true] {
+                    for format in ["json", "table"] {
+                        take_json_output();
+                        let mut calls = 0;
+                        let result = handle_list_command(
+                            Some("ws-test".into()),
+                            None,
+                            None,
+                            format,
+                            |request| {
+                                calls += 1;
+                                assert_list_request(
+                                    &request,
+                                    Some("ws-test"),
+                                    DEFAULT_LIST_PAGE_LIMIT,
+                                    (calls > 1).then_some("safe"),
+                                );
+                                std::future::ready(if calls == 1 {
+                                    Ok(if summary {
+                                        list_summary_page("a", Some("safe"))
+                                    } else {
+                                        list_page(&["a"], Some("safe"))
+                                    })
+                                } else if recover && calls == 4 {
+                                    Ok(list_page(&["b"], None))
+                                } else {
+                                    Err(anyhow::Error::new(io::Error::new(kind, "test"))
+                                        .context("failed to connect to ws-ckpt daemon"))
+                                })
+                            },
+                        )
+                        .await;
+                        let output = take_json_output();
+                        if recover {
+                            result.unwrap();
+                            assert_eq!(calls, 4);
+                            if format == "json" {
+                                let output = output.unwrap();
+                                assert_eq!(output.as_array().unwrap().len(), 2);
+                                assert_eq!(output[0]["id"], "a");
+                                assert_eq!(output[1]["id"], "b");
+                            } else {
+                                assert!(output.is_none());
+                            }
+                        } else {
+                            let error = result.unwrap_err();
+                            assert_eq!(calls, 5);
+                            assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
+                            let error = format!("{error:#}");
+                            assert!(error.contains("after 1 accepted snapshot(s)"), "{error}");
+                            assert!(error.contains("workspace=\"ws-test\""), "{error}");
+                            assert!(error.contains("resume_cursor=\"safe\""), "{error}");
+                            assert!(
+                                error.contains(
+                                    "Start the systemd service `ws-ckpt`, or its daemon container."
+                                ),
+                                "{error}"
+                            );
+                            assert!(output.is_none());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3501,10 +4161,51 @@ mod tests {
                 pages.into_iter().map(Some).collect(),
             )
             .await;
-            let error = result.unwrap_err().to_string();
+            let error = format!("{:#}", result.unwrap_err());
             assert!(error.contains(expected_error), "{error}");
+            assert!(error.contains("resume_cursor="), "{error}");
             assert!(output.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn list_rejects_bad_summary_cursors_before_accepting_the_entry() {
+        for (next_cursor, expected_error) in [
+            (String::new(), "cursor length"),
+            ("safe".to_string(), "repeated"),
+            ("x".repeat(MAX_LIST_CURSOR_BYTES + 1), "cursor length"),
+        ] {
+            let (result, requests, output) = run_list_script(
+                &["ws-ckpt", "list", "--format", "json"],
+                vec![
+                    Some(list_summary_page("accepted", Some("safe"))),
+                    Some(list_summary_page("rejected", Some(&next_cursor))),
+                ],
+            )
+            .await;
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains(expected_error), "{error}");
+            assert!(error.contains("after 1 accepted snapshot(s)"), "{error}");
+            assert!(error.contains("resume_cursor=\"safe\""), "{error}");
+            assert_eq!(requests.len(), 2);
+            assert!(output.is_none());
+        }
+
+        let (result, requests, output) = run_list_script(
+            &["ws-ckpt", "list", "--format", "json"],
+            vec![
+                Some(list_page(&["a"], Some("one"))),
+                Some(list_summary_page("b", Some("two"))),
+                Some(list_summary_page("rejected", Some("one"))),
+            ],
+        )
+        .await;
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("repeated"), "{error}");
+        assert!(error.contains("after 2 accepted snapshot(s)"), "{error}");
+        assert!(error.contains("resume_cursor=\"two\""), "{error}");
+        assert_eq!(requests.len(), 3);
+        assert!(output.is_none());
     }
 
     #[tokio::test]
@@ -3512,6 +4213,7 @@ mod tests {
         for (page, expected_error) in [
             (list_page(&["a", "b"], None), "exceeds requested limit"),
             (list_page(&["a"], Some("start")), "repeated"),
+            (list_summary_page("large", Some("start")), "repeated"),
         ] {
             let (result, _, output) = run_list_script(
                 &[
@@ -3520,7 +4222,10 @@ mod tests {
                 vec![Some(page)],
             )
             .await;
-            assert!(result.unwrap_err().to_string().contains(expected_error));
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains(expected_error), "{error}");
+            assert!(error.contains("after 0 accepted snapshot(s)"), "{error}");
+            assert!(error.contains("resume_cursor=\"start\""), "{error}");
             assert!(output.is_none());
         }
     }
@@ -3547,14 +4252,88 @@ mod tests {
     }
 
     #[test]
+    fn list_table_marks_each_summary_and_omission_without_losing_metadata() {
+        let Response::ListPageSummaryOk { snapshot, .. } = list_summary_page("large-missing", None)
+        else {
+            unreachable!()
+        };
+        let date = snapshot
+            .meta
+            .created_at
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let mut present = snapshot.clone();
+        present.id = "large-present".to_string();
+        present.meta.missing = false;
+        let Response::ListPageOk {
+            snapshots: full, ..
+        } = list_page(&["full"], None)
+        else {
+            unreachable!()
+        };
+        let mut snapshots = vec![
+            ListedSnapshot::from(snapshot),
+            ListedSnapshot::from(present),
+        ];
+        snapshots.extend(full.into_iter().map(ListedSnapshot::from));
+        for (single_page, incomplete, label) in [
+            (false, false, "Total"),
+            (true, false, "Page"),
+            (false, true, "Partial"),
+        ] {
+            let mut output = Vec::new();
+            write_list_table(
+                &mut output,
+                &snapshots,
+                single_page,
+                Some("safe"),
+                incomplete,
+            )
+            .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("large-missing [MISSING] [SUMMARY]"));
+            assert!(output.contains("large-present [SUMMARY]"));
+            assert_eq!(output.matches("[SUMMARY]").count(), 2);
+            assert_eq!(output.matches("[MISSING]").count(), 1);
+            for line in output.lines().filter(|line| line.contains("[SUMMARY]")) {
+                assert!(line.contains("ws-test"));
+                assert!(line.contains(&date));
+                assert!(
+                    line.ends_with("omitted meta fields: message, metadata, parent_id, child_ids")
+                );
+            }
+            let full_line = output
+                .lines()
+                .find(|line| line.ends_with("checkpoint full"))
+                .unwrap();
+            assert!(full_line.contains("ws-test"));
+            assert!(full_line.contains(&date));
+            assert!(!full_line.contains("[SUMMARY]"));
+            assert!(!full_line.contains("omitted"));
+            assert!(output.contains(&format!("{label}: 3 snapshot(s)")));
+            assert_eq!(output.starts_with("INCOMPLETE:"), incomplete);
+            assert_eq!(
+                output.contains("Next cursor: safe"),
+                single_page || incomplete
+            );
+            if incomplete {
+                assert!(!output.contains("Total:"));
+                assert!(!output.contains("Page:"));
+            }
+        }
+    }
+
+    #[test]
     fn list_table_distinguishes_page_count_from_total() {
         let Response::ListPageOk { mut snapshots, .. } = list_page(&["a"], None) else {
             unreachable!()
         };
         snapshots[0].meta.missing = true;
+        let snapshots: Vec<_> = snapshots.into_iter().map(ListedSnapshot::from).collect();
         for single_page in [false, true] {
             let mut output = Vec::new();
-            write_list_table(&mut output, &snapshots, single_page, Some("next")).unwrap();
+            write_list_table(&mut output, &snapshots, single_page, Some("next"), false).unwrap();
             let output = String::from_utf8(output).unwrap();
             assert!(output.contains("a [MISSING]"));
             if single_page {
@@ -3567,14 +4346,23 @@ mod tests {
             }
         }
         let mut output = Vec::new();
-        write_list_table(&mut output, &[], true, None).unwrap();
+        write_list_table(&mut output, &[], true, None, false).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "No snapshots found.\n\nPage: 0 snapshot(s)\nNext cursor: (none)\n"
         );
         let mut output = Vec::new();
-        write_list_table(&mut output, &[], false, None).unwrap();
+        write_list_table(&mut output, &[], false, None, false).unwrap();
         assert_eq!(String::from_utf8(output).unwrap(), "No snapshots found.\n");
+        let mut output = Vec::new();
+        write_list_table(&mut output, &snapshots, false, Some("next"), true).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with("INCOMPLETE:"));
+        assert!(output.contains("a [MISSING]"));
+        assert!(output.contains("Partial: 1 snapshot(s)"));
+        assert!(output.contains("Next cursor: next"));
+        assert!(!output.contains("Total:"));
+        assert!(!output.contains("Page:"));
     }
 
     #[test]

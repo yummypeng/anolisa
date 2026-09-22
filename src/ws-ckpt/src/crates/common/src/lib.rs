@@ -66,6 +66,9 @@ pub enum WsCkptError {
     Json(#[from] serde_json::Error),
     #[error("frame too large: {size} bytes (max {max})")]
     FrameTooLarge { size: u64, max: u32 },
+    /// Reject a serializer that writes a different length than its sizing pass.
+    #[error("encoded payload size changed: expected {expected} bytes, wrote {actual}")]
+    EncodedSizeMismatch { expected: u64, actual: u64 },
     #[error("config error: {0}")]
     Config(String),
 }
@@ -209,7 +212,7 @@ pub enum Request {
     RecoverConfirmed {
         preview: RecoveryPreview,
     },
-    /// Read a byte-bounded page ordered by creation time, workspace ID, and snapshot ID.
+    /// Read creation-time/workspace-ID/snapshot-ID ordered pages; oversized entries return ListPageSummaryOk.
     ListPage {
         /// Workspace path or ID; `None` selects all registered workspaces.
         workspace: Option<String>,
@@ -391,11 +394,18 @@ pub enum Response {
     RecoverPreviewOk {
         preview: RecoveryPreview,
     },
-    /// A live page, not a frozen view of the index across requests.
+    /// Live entries within the first page's upper key, not a frozen snapshot of membership or metadata.
     ListPageOk {
-        /// Entries read on this page, including pinned and missing records.
+        /// Includes pinned/missing records and later inserts above the cursor but at or below its upper key.
         snapshots: Vec<SnapshotEntry>,
-        /// Pass unchanged to continue; `None` means traversal is exhausted.
+        /// Pass unchanged; `None` ends traversal. Restart without a cursor to see keys above the upper bound.
+        next_cursor: Option<String>,
+    },
+    /// One oversized entry projected to basic fields; counts as one entry toward the requested limit.
+    ListPageSummaryOk {
+        /// Omits message, metadata, parent_id and child_ids without changing the stored snapshot.
+        snapshot: SnapshotSummary,
+        /// Same ListPage cursor contract, positioned after the returned summary, never before it.
         next_cursor: Option<String>,
     },
 }
@@ -432,7 +442,7 @@ pub enum ErrorCode {
     InvalidListRequest,
     /// A list cursor is malformed or belongs to a different query scope.
     InvalidListCursor,
-    /// One snapshot and its continuation cannot fit in an IPC frame.
+    /// Even the snapshot identity/basic fields or its required cursor exceed their budgets.
     ListEntryTooLarge,
 }
 
@@ -686,6 +696,22 @@ pub struct SnapshotEntry {
     pub id: String,
     pub workspace: String,
     pub meta: SnapshotMeta,
+}
+
+/// Exact identity and basic fields when a complete list entry exceeds the frame budget.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SnapshotSummary {
+    pub id: String,
+    pub workspace: String,
+    pub meta: SnapshotSummaryMeta,
+}
+
+/// Deliberately excludes message, metadata, parent_id and child_ids; absence does not mean null.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct SnapshotSummaryMeta {
+    pub pinned: bool,
+    pub created_at: DateTime<Utc>,
+    pub missing: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1318,6 +1344,13 @@ pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, WsCkptError> {
     let mut frame = Vec::with_capacity(4 + size as usize);
     frame.extend_from_slice(&(size as u32).to_le_bytes());
     bincode::serialize_into(&mut frame, msg)?;
+    let actual = (frame.len() - 4) as u64;
+    if actual != size {
+        return Err(WsCkptError::EncodedSizeMismatch {
+            expected: size,
+            actual,
+        });
+    }
     Ok(frame)
 }
 
@@ -1981,6 +2014,40 @@ mod tests {
     }
 
     #[test]
+    fn encode_frame_rejects_size_changes_in_both_directions() {
+        struct ChangingSize {
+            first: std::cell::Cell<bool>,
+            measured: &'static str,
+            written: &'static str,
+        }
+
+        impl Serialize for ChangingSize {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(if self.first.replace(false) {
+                    self.measured
+                } else {
+                    self.written
+                })
+            }
+        }
+
+        for (measured, written) in [("short", "longer value"), ("longer value", "short")] {
+            let message = ChangingSize {
+                first: std::cell::Cell::new(true),
+                measured,
+                written,
+            };
+            match encode_frame(&message) {
+                Err(WsCkptError::EncodedSizeMismatch { expected, actual }) => {
+                    assert_eq!(expected, 8 + measured.len() as u64);
+                    assert_eq!(actual, 8 + written.len() as u64);
+                }
+                other => panic!("expected a size mismatch, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn list_page_extensions_preserve_existing_wire_layout() {
         let requests = [
             Request::List {
@@ -2021,8 +2088,20 @@ mod tests {
                 }],
                 next_cursor: Some("opaque".into()),
             },
+            Response::ListPageSummaryOk {
+                snapshot: SnapshotSummary {
+                    id: "entry".into(),
+                    workspace: "/ws".into(),
+                    meta: SnapshotSummaryMeta {
+                        pinned: true,
+                        created_at: Utc::now(),
+                        missing: true,
+                    },
+                },
+                next_cursor: Some("opaque".into()),
+            },
         ];
-        for (response, tag) in responses.iter().zip([5_u32, 29]) {
+        for (response, tag) in responses.iter().zip([5_u32, 29, 30]) {
             let bytes = bincode::serialize(response).unwrap();
             assert_eq!(&bytes[..4], &tag.to_le_bytes());
             assert_eq!(encoded_payload_size(response).unwrap(), bytes.len() as u64);
